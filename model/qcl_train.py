@@ -1,6 +1,7 @@
-import pennylane as qml
-from pennylane import numpy as np
-from pennylane.templates import StronglyEntanglingLayers
+try:
+    import pennylane as qml
+except ModuleNotFoundError:
+    qml = None
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,11 +28,32 @@ from muse_eeg_model import Proj_eeg, Proj_img, Enc_nervformer_eeg, Enc_muse_eeg,
 gpus = [0]
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, gpus))
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 # result_path = '/home/NICE/results/' 
-result_path = '/home/aidan/QuantumMUSE_EEG/results/' 
-model_path = '/home/aidan/QuantumMUSE_EEG/model/' 
+result_path = os.path.join(BASE_DIR, 'results') + os.sep
+model_path = os.path.join(BASE_DIR, 'model') + os.sep
 
 model_idx = 'test0'
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', '1', 'y'):
+        return True
+    if v.lower() in ('no', 'false', 'f', '0', 'n'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def get_ablation_mode(args):
+    if not args.use_quantum and not args.use_contrastive:
+        return 'baseline'
+    if not args.use_quantum and args.use_contrastive:
+        return 'contrastive_only'
+    if args.use_quantum and not args.use_contrastive:
+        return 'quantum_only'
+    return 'full_qmcl'
  
 parser = argparse.ArgumentParser(description='Experiment Stimuli Recognition test with CLIP encoder')
 parser.add_argument('--dnn', default='clip', type=str)
@@ -45,6 +67,18 @@ parser.add_argument('-batch_size', '--batch-size', default=1000, type=int,
                          'using Data Parallel or Distributed Data Parallel')
 parser.add_argument('--seed', default=2024, type=int,
                     help='seed for initializing training. ')
+parser.add_argument('--use_quantum', default=True, type=str2bool, nargs='?', const=True,
+                    help='use the quantum layer in the projection heads')
+parser.add_argument('--use_contrastive', default=True, type=str2bool, nargs='?', const=True,
+                    help='use the original contrastive loss')
+parser.add_argument('--use_classical_replacement', default=False, type=str2bool, nargs='?', const=True,
+                    help='replace the quantum layer with a small MLP when --use_quantum False')
+parser.add_argument('--data_root', default=BASE_DIR, type=str,
+                    help='repository/data root containing Data/Things-EEG2')
+parser.add_argument('--result_path', default=result_path, type=str,
+                    help='directory for logs and CSV results')
+parser.add_argument('--model_path', default=model_path, type=str,
+                    help='directory for model checkpoints')
 
 
 def weights_init_normal(m):
@@ -79,10 +113,13 @@ def weights_init_normal(m):
 #         return self.qlayer(x)
 
 class QuantumLayer(nn.Module):
-    def __init__(self, n_qubits=10, n_layers=4, input_dim=768, output_dim=768):
+    def __init__(self, n_qubits=10, n_layers=4, input_dim=768, output_dim=768,
+                 use_quantum=True, use_classical_replacement=False):
         super(QuantumLayer, self).__init__()
         self.n_qubits = n_qubits
         self.n_layers = n_layers
+        self.use_quantum = use_quantum
+        self.use_classical_replacement = use_classical_replacement
 
         self.fc_in = nn.Linear(input_dim, n_qubits)  # 將輸入特徵數縮減至量子位數量
 
@@ -98,16 +135,66 @@ class QuantumLayer(nn.Module):
         self.qlayer = qml.qnn.TorchLayer(quantum_circuit, weight_shapes)
         self.fc_out = nn.Linear(n_qubits, output_dim)  # 將輸出特徵數增加回768維
 
+        self.classical_layer = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
+            nn.ReLU(),
+            nn.Linear(output_dim, output_dim),
+        )
+
     def forward(self, x):
+        if not self.use_quantum:
+            if self.use_classical_replacement:
+                return self.classical_layer(x)
+            return x
         x = self.fc_in(x)  # 降維
         x = self.qlayer(x)  # 進行量子計算
         x = self.fc_out(x)  # 回到原始維度
         return x
 
 
+class AblationQuantumLayer(nn.Module):
+    def __init__(self, n_qubits=10, n_layers=4, input_dim=768, output_dim=768,
+                 use_quantum=True, use_classical_replacement=False):
+        super(AblationQuantumLayer, self).__init__()
+        self.use_quantum = use_quantum
+        self.use_classical_replacement = use_classical_replacement
+
+        if self.use_quantum:
+            if qml is None:
+                raise ModuleNotFoundError('pennylane is required when --use_quantum True')
+            self.fc_in = nn.Linear(input_dim, n_qubits)
+            dev = qml.device("default.qubit", wires=n_qubits)
+
+            @qml.qnode(dev, interface='torch')
+            def quantum_circuit(inputs, weights):
+                qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
+                qml.templates.StronglyEntanglingLayers(weights, wires=range(n_qubits))
+                return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
+
+            weight_shapes = {"weights": (n_layers, n_qubits, 3)}
+            self.qlayer = qml.qnn.TorchLayer(quantum_circuit, weight_shapes)
+            self.fc_out = nn.Linear(n_qubits, output_dim)
+        elif self.use_classical_replacement:
+            self.classical_layer = nn.Sequential(
+                nn.Linear(input_dim, output_dim),
+                nn.ReLU(),
+                nn.Linear(output_dim, output_dim),
+            )
+
+    def forward(self, x):
+        if self.use_quantum:
+            x = self.fc_in(x)
+            x = self.qlayer(x)
+            return self.fc_out(x)
+        if self.use_classical_replacement:
+            return self.classical_layer(x)
+        return x
+
+
 
 class Proj_eeg(nn.Sequential):
-    def __init__(self, embedding_dim=1440, proj_dim=768, drop_proj=0.5, n_qubits=10, n_layers=4):
+    def __init__(self, embedding_dim=1440, proj_dim=768, drop_proj=0.5, n_qubits=10, n_layers=4,
+                 use_quantum=True, use_classical_replacement=False):
         super().__init__(
             nn.Linear(embedding_dim, proj_dim),
             ResidualAdd(nn.Sequential(
@@ -116,11 +203,12 @@ class Proj_eeg(nn.Sequential):
                 nn.Dropout(drop_proj),
             )),
             nn.LayerNorm(proj_dim),
-            QuantumLayer(n_qubits, n_layers),
+            AblationQuantumLayer(n_qubits, n_layers, proj_dim, proj_dim, use_quantum, use_classical_replacement),
         )
 
 class Proj_img(nn.Sequential):
-    def __init__(self, embedding_dim=768, proj_dim=768, drop_proj=0.3, n_qubits=10, n_layers=4):
+    def __init__(self, embedding_dim=768, proj_dim=768, drop_proj=0.3, n_qubits=10, n_layers=4,
+                 use_quantum=True, use_classical_replacement=False):
         super().__init__(
             nn.Linear(embedding_dim, proj_dim),
             ResidualAdd(nn.Sequential(
@@ -129,7 +217,7 @@ class Proj_img(nn.Sequential):
                 nn.Dropout(drop_proj),
             )),
             nn.LayerNorm(proj_dim),
-            QuantumLayer(n_qubits, n_layers),
+            AblationQuantumLayer(n_qubits, n_layers, proj_dim, proj_dim, use_quantum, use_classical_replacement),
         )
     def forward(self, x):
         return x 
@@ -153,14 +241,23 @@ class IE():
 
         self.model_idx = 'test0_' + str(self.nSub) + '_'
 
-        local_path = '/home/aidan/QuantumMUSE_EEG/'
+        local_path = os.path.abspath(args.data_root) + os.sep
+        self.result_path = os.path.abspath(args.result_path) + os.sep
+        self.model_path = os.path.abspath(args.model_path) + os.sep
+        os.makedirs(self.result_path, exist_ok=True)
+        os.makedirs(self.model_path, exist_ok=True)
+        self.ablation_mode = get_ablation_mode(args)
+        print('Ablation mode:', self.ablation_mode,
+              'use_quantum:', args.use_quantum,
+              'use_contrastive:', args.use_contrastive,
+              'use_classical_replacement:', args.use_classical_replacement)
 
         self.start_epoch = 0
-        self.eeg_data_path = local_path + 'Data/Things-EEG2/Preprocessed_data_250Hz/'
-        self.img_data_path = local_path + 'Data/Things-EEG2/DNN_feature_maps/pca_feature_maps/' + args.dnn + '/pretrained-True/'
-        self.test_center_path = local_path + 'Data/Things-EEG2/Image_set/'
+        self.eeg_data_path = os.path.join(local_path, 'Data', 'Things-EEG2', 'Preprocessed_data_250Hz') + os.sep
+        self.img_data_path = os.path.join(local_path, 'Data', 'Things-EEG2', 'DNN_feature_maps', 'pca_feature_maps', args.dnn, 'pretrained-True') + os.sep
+        self.test_center_path = os.path.join(local_path, 'Data', 'Things-EEG2', 'Image_set') + os.sep
 
-        self.log_write = open(result_path + "log_subject%d.txt" % self.nSub, "w")
+        self.log_write = open(self.result_path + "log_subject%d.txt" % self.nSub, "w")
 
         self.Tensor = torch.cuda.FloatTensor
         self.LongTensor = torch.cuda.LongTensor
@@ -168,8 +265,10 @@ class IE():
         self.criterion_l1 = torch.nn.L1Loss().cuda()
         self.criterion_l2 = torch.nn.MSELoss().cuda()
         self.criterion_cls = torch.nn.CrossEntropyLoss().cuda()
-        self.Proj_eeg = Proj_eeg().cuda()
-        self.Proj_img = Proj_img().cuda()
+        self.Proj_eeg = Proj_eeg(use_quantum=args.use_quantum,
+                                 use_classical_replacement=args.use_classical_replacement).cuda()
+        self.Proj_img = Proj_img(use_quantum=args.use_quantum,
+                                 use_classical_replacement=args.use_classical_replacement).cuda()
         self.Proj_eeg = nn.DataParallel(self.Proj_eeg, device_ids=[i for i in range(len(gpus))])
         self.Proj_img = nn.DataParallel(self.Proj_img, device_ids=[i for i in range(len(gpus))])
 
@@ -326,8 +425,11 @@ class IE():
 
                 loss_cos = (loss_eeg + loss_img) / 2
 
-                # total loss SK-InfoNCE loss
-                loss = loss_cos + eeg_img_cos_sim_loss
+                if self.args.use_contrastive:
+                    # total loss SK-InfoNCE loss
+                    loss = loss_cos + eeg_img_cos_sim_loss
+                else:
+                    loss = self.criterion_cls(logits_per_eeg, labels)
 
                 # INfoNCE loss
                 # loss = loss_cos 
@@ -367,17 +469,20 @@ class IE():
                         vloss_eeg = self.criterion_cls(vlogits_per_eeg, vlabels)
                         vloss_img = self.criterion_cls(vlogits_per_img, vlabels)
 
-                        vloss = (vloss_eeg + vloss_img) / 2
+                        if self.args.use_contrastive:
+                            vloss = (vloss_eeg + vloss_img) / 2
+                        else:
+                            vloss = self.criterion_cls(vlogits_per_eeg, vlabels)
 
                         if vloss <= best_loss_val:
                             best_loss_val = vloss
                             best_epoch = e + 1
 
                             # torch.save(self.Enc_nervformer_eeg.module.state_dict(), model_path + self.model_idx + 'Enc_custom_eeg_cls.pth')
-                            torch.save(self.Enc_muse_eeg.module.state_dict(), model_path + self.model_idx + 'Enc_custom_eeg_cls.pth')
+                            torch.save(self.Enc_muse_eeg.module.state_dict(), self.model_path + self.model_idx + 'Enc_custom_eeg_cls.pth')
 
-                            torch.save(self.Proj_eeg.module.state_dict(), model_path + self.model_idx + 'Proj_eeg_cls.pth')
-                            torch.save(self.Proj_img.module.state_dict(), model_path + self.model_idx + 'Proj_img_cls.pth')
+                            torch.save(self.Proj_eeg.module.state_dict(), self.model_path + self.model_idx + 'Proj_eeg_cls.pth')
+                            torch.save(self.Proj_img.module.state_dict(), self.model_path + self.model_idx + 'Proj_img_cls.pth')
 
                 print('Epoch:', e,
                     '  Cos eeg: %.4f' % loss_eeg.detach().cpu().numpy(),
@@ -395,10 +500,10 @@ class IE():
         top5 = 0
 
         # self.Enc_nervformer_eeg.load_state_dict(torch.load(model_path + self.model_idx + 'Enc_custom_eeg_cls.pth'), strict=False)
-        self.Enc_muse_eeg.load_state_dict(torch.load(model_path + self.model_idx + 'Enc_custom_eeg_cls.pth'), strict=False)
+        self.Enc_muse_eeg.load_state_dict(torch.load(self.model_path + self.model_idx + 'Enc_custom_eeg_cls.pth'), strict=False)
 
-        self.Proj_eeg.load_state_dict(torch.load(model_path + self.model_idx + 'Proj_eeg_cls.pth'), strict=False)
-        self.Proj_img.load_state_dict(torch.load(model_path + self.model_idx + 'Proj_img_cls.pth'), strict=False)
+        self.Proj_eeg.load_state_dict(torch.load(self.model_path + self.model_idx + 'Proj_eeg_cls.pth'), strict=False)
+        self.Proj_img.load_state_dict(torch.load(self.model_path + self.model_idx + 'Proj_img_cls.pth'), strict=False)
 
         # self.Enc_nervformer_eeg.eval()
         self.Enc_muse_eeg.eval()
@@ -434,11 +539,35 @@ class IE():
         print('The test Top1-%.6f, Top3-%.6f, Top5-%.6f' % (top1_acc, top3_acc, top5_acc))
         self.log_write.write('The best epoch is: %d\n' % best_epoch)
         self.log_write.write('The test Top1-%.6f, Top3-%.6f, Top5-%.6f\n' % (top1_acc, top3_acc, top5_acc))
+        self.log_write.close()
+
+        ablation_row = pd.DataFrame([{
+            'time': datetime.datetime.now().isoformat(timespec='seconds'),
+            'subject': self.nSub,
+            'mode': self.ablation_mode,
+            'use_quantum': self.args.use_quantum,
+            'use_contrastive': self.args.use_contrastive,
+            'use_classical_replacement': self.args.use_classical_replacement,
+            'top1': top1_acc,
+            'top3': top3_acc,
+            'top5': top5_acc,
+            'best_epoch': best_epoch,
+            'epochs': self.n_epochs,
+            'dnn': self.args.dnn,
+        }])
+        ablation_csv = self.result_path + 'ablation_results.csv'
+        ablation_row.to_csv(ablation_csv, mode='a', header=not os.path.exists(ablation_csv), index=False)
         
         return top1_acc, top3_acc, top5_acc
 
 def main():
     args = parser.parse_args()
+    args.data_root = os.path.abspath(args.data_root)
+    args.result_path = os.path.abspath(args.result_path)
+    args.model_path = os.path.abspath(args.model_path)
+    os.makedirs(args.result_path, exist_ok=True)
+    os.makedirs(args.model_path, exist_ok=True)
+    print('Running mode:', get_ablation_mode(args))
 
     num_sub = args.num_sub   
     
@@ -480,7 +609,7 @@ def main():
     column = np.arange(1, cal_num+1).tolist()
     column.append('ave')
     pd_all = pd.DataFrame(columns=column, data=[aver, aver3, aver5])
-    pd_all.to_csv(result_path + 'result.csv')
+    pd_all.to_csv(os.path.join(args.result_path, 'result.csv'))
 
 
 class Print_model_info():

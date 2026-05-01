@@ -213,9 +213,49 @@ class Enc_muse_eeg(nn.Sequential):
             STConvEEGModel(output_dim),
             FlattenHead()
         )
+
+
+class QuantumLayer(nn.Module):
+    def __init__(self, n_qubits=10, n_layers=4, input_dim=768, output_dim=768,
+                 use_quantum=False, use_classical_replacement=False):
+        super(QuantumLayer, self).__init__()
+        self.use_quantum = use_quantum
+        self.use_classical_replacement = use_classical_replacement
+
+        if self.use_quantum:
+            import pennylane as qml
+
+            self.fc_in = nn.Linear(input_dim, n_qubits)
+            dev = qml.device("default.qubit", wires=n_qubits)
+
+            @qml.qnode(dev, interface='torch')
+            def quantum_circuit(inputs, weights):
+                qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
+                qml.templates.StronglyEntanglingLayers(weights, wires=range(n_qubits))
+                return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
+
+            weight_shapes = {"weights": (n_layers, n_qubits, 3)}
+            self.qlayer = qml.qnn.TorchLayer(quantum_circuit, weight_shapes)
+            self.fc_out = nn.Linear(n_qubits, output_dim)
+        elif self.use_classical_replacement:
+            self.classical_layer = nn.Sequential(
+                nn.Linear(input_dim, output_dim),
+                nn.ReLU(),
+                nn.Linear(output_dim, output_dim),
+            )
+
+    def forward(self, x):
+        if self.use_quantum:
+            x = self.fc_in(x)
+            x = self.qlayer(x)
+            return self.fc_out(x)
+        if self.use_classical_replacement:
+            return self.classical_layer(x)
+        return x
         
 class Proj_eeg(nn.Sequential):
-    def __init__(self, embedding_dim=1440, proj_dim=768, drop_proj=0.5):
+    def __init__(self, embedding_dim=1440, proj_dim=768, drop_proj=0.5, n_qubits=10, n_layers=4,
+                 use_quantum=False, use_classical_replacement=False):
         super().__init__(
             nn.Linear(embedding_dim, proj_dim),
             ResidualAdd(nn.Sequential(
@@ -224,11 +264,13 @@ class Proj_eeg(nn.Sequential):
                 nn.Dropout(drop_proj),
             )),
             nn.LayerNorm(proj_dim),
+            QuantumLayer(n_qubits, n_layers, proj_dim, proj_dim, use_quantum, use_classical_replacement),
         )
 
 
 class Proj_img(nn.Sequential):
-    def __init__(self, embedding_dim=768, proj_dim=768, drop_proj=0.3):
+    def __init__(self, embedding_dim=768, proj_dim=768, drop_proj=0.3, n_qubits=10, n_layers=4,
+                 use_quantum=False, use_classical_replacement=False):
         super().__init__(
             nn.Linear(embedding_dim, proj_dim),
             ResidualAdd(nn.Sequential(
@@ -237,6 +279,7 @@ class Proj_img(nn.Sequential):
                 nn.Dropout(drop_proj),
             )),
             nn.LayerNorm(proj_dim),
+            QuantumLayer(n_qubits, n_layers, proj_dim, proj_dim, use_quantum, use_classical_replacement),
         )
     def forward(self, x):
         return x 
