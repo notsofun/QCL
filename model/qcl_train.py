@@ -22,7 +22,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from muse_eeg_model import Proj_eeg, Proj_img, Enc_nervformer_eeg, Enc_muse_eeg, ResidualAdd
+from muse_eeg_model import Enc_nervformer_eeg, Enc_muse_eeg, ResidualAdd, Proj_video, VideoTextFeatureExtractor
 
 
 gpus = [0]
@@ -46,16 +46,9 @@ def str2bool(v):
     raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def get_ablation_mode(args):
-    if not args.use_quantum and not args.use_contrastive:
-        return 'baseline'
-    if not args.use_quantum and args.use_contrastive:
-        return 'contrastive_only'
-    if args.use_quantum and not args.use_contrastive:
-        return 'quantum_only'
-    return 'full_qmcl'
- 
 parser = argparse.ArgumentParser(description='Experiment Stimuli Recognition test with CLIP encoder')
+parser.add_argument('--task', default='eeg_image', choices=['eeg_image', 'video_text'],
+                    help='training task: original Things-EEG2 EEG-image, or video-description contrastive learning')
 parser.add_argument('--dnn', default='clip', type=str)
 parser.add_argument('--epoch', default='200', type=int)
 parser.add_argument('--num_sub', default=1, type=int,
@@ -67,18 +60,42 @@ parser.add_argument('-batch_size', '--batch-size', default=1000, type=int,
                          'using Data Parallel or Distributed Data Parallel')
 parser.add_argument('--seed', default=2024, type=int,
                     help='seed for initializing training. ')
-parser.add_argument('--use_quantum', default=True, type=str2bool, nargs='?', const=True,
-                    help='use the quantum layer in the projection heads')
-parser.add_argument('--use_contrastive', default=True, type=str2bool, nargs='?', const=True,
-                    help='use the original contrastive loss')
-parser.add_argument('--use_classical_replacement', default=False, type=str2bool, nargs='?', const=True,
-                    help='replace the quantum layer with a small MLP when --use_quantum False')
 parser.add_argument('--data_root', default=BASE_DIR, type=str,
                     help='repository/data root containing Data/Things-EEG2')
 parser.add_argument('--result_path', default=result_path, type=str,
                     help='directory for logs and CSV results')
 parser.add_argument('--model_path', default=model_path, type=str,
                     help='directory for model checkpoints')
+parser.add_argument('--manifest', default=None, type=str,
+                    help='video_text task manifest CSV with video_path,text columns')
+parser.add_argument('--feature_dim', default=768, type=int,
+                    help='video_text fixed feature dimension')
+parser.add_argument('--proj_dim', default=768, type=int,
+                    help='video_text projection/contrastive dimension')
+parser.add_argument('--num_frames', default=8, type=int,
+                    help='number of video frames sampled for video_text features')
+parser.add_argument('--feature_backend', default='clip', choices=['clip', 'handcraft'],
+                    help='video_text feature extractor: CLIP frame/text embeddings or hand-crafted fallback')
+parser.add_argument('--clip_model', default='openai/clip-vit-base-patch32', type=str,
+                    help='Hugging Face CLIP model used when --feature_backend clip')
+parser.add_argument('--clip_batch_size', default=16, type=int,
+                    help='batch size for CLIP frame encoding')
+parser.add_argument('--use_quantum', default=True, type=str2bool, nargs='?', const=True,
+                    help='video_text: add the quantum layer to the video projection head')
+parser.add_argument('--n_qubits', default=10, type=int,
+                    help='video_text quantum qubit count')
+parser.add_argument('--n_layers', default=4, type=int,
+                    help='video_text quantum layer count')
+parser.add_argument('--lr', default=0.0002, type=float,
+                    help='video_text learning rate')
+parser.add_argument('--val_ratio', default=0.1, type=float,
+                    help='video_text validation split ratio')
+parser.add_argument('--test_ratio', default=0.2, type=float,
+                    help='video_text test split ratio')
+parser.add_argument('--device', default='auto', type=str,
+                    help='video_text device: auto, cpu, cuda')
+parser.add_argument('--eval_on_all', default=False, type=str2bool, nargs='?', const=True,
+                    help='video_text: evaluate the best checkpoint on all manifest rows instead of only the test split')
 
 
 def weights_init_normal(m):
@@ -91,38 +108,13 @@ def weights_init_normal(m):
         init.normal_(m.weight.data, 1.0, 0.02)
         init.constant_(m.bias.data, 0.0)
 
-
-# class QuantumLayer(nn.Module):
-#     def __init__(self, n_qubits, n_layers):
-#         super(QuantumLayer, self).__init__()
-#         self.n_qubits = n_qubits
-#         self.n_layers = n_layers
-
-#         dev = qml.device("default.qubit", wires=n_qubits)
-
-#         @qml.qnode(dev, interface='torch')
-#         def quantum_circuit(inputs, weights):
-#             qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
-#             qml.templates.StronglyEntanglingLayers(weights, wires=range(n_qubits))
-#             return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
-
-#         weight_shapes = {"weights": (n_layers, n_qubits, 3)}
-#         self.qlayer = qml.qnn.TorchLayer(quantum_circuit, weight_shapes)
-
-#     def forward(self, x):
-#         return self.qlayer(x)
-
 class QuantumLayer(nn.Module):
-    def __init__(self, n_qubits=10, n_layers=4, input_dim=768, output_dim=768,
-                 use_quantum=True, use_classical_replacement=False):
+    def __init__(self, n_qubits=10, n_layers=4, input_dim=768, output_dim=768):
         super(QuantumLayer, self).__init__()
-        self.n_qubits = n_qubits
-        self.n_layers = n_layers
-        self.use_quantum = use_quantum
-        self.use_classical_replacement = use_classical_replacement
+        if qml is None:
+            raise ModuleNotFoundError('pennylane is required for qcl_train.py')
 
-        self.fc_in = nn.Linear(input_dim, n_qubits)  # 將輸入特徵數縮減至量子位數量
-
+        self.fc_in = nn.Linear(input_dim, n_qubits)
         dev = qml.device("default.qubit", wires=n_qubits)
 
         @qml.qnode(dev, interface='torch')
@@ -133,68 +125,16 @@ class QuantumLayer(nn.Module):
 
         weight_shapes = {"weights": (n_layers, n_qubits, 3)}
         self.qlayer = qml.qnn.TorchLayer(quantum_circuit, weight_shapes)
-        self.fc_out = nn.Linear(n_qubits, output_dim)  # 將輸出特徵數增加回768維
-
-        self.classical_layer = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
-            nn.ReLU(),
-            nn.Linear(output_dim, output_dim),
-        )
+        self.fc_out = nn.Linear(n_qubits, output_dim)
 
     def forward(self, x):
-        if not self.use_quantum:
-            if self.use_classical_replacement:
-                return self.classical_layer(x)
-            return x
-        x = self.fc_in(x)  # 降維
-        x = self.qlayer(x)  # 進行量子計算
-        x = self.fc_out(x)  # 回到原始維度
-        return x
-
-
-class AblationQuantumLayer(nn.Module):
-    def __init__(self, n_qubits=10, n_layers=4, input_dim=768, output_dim=768,
-                 use_quantum=True, use_classical_replacement=False):
-        super(AblationQuantumLayer, self).__init__()
-        self.use_quantum = use_quantum
-        self.use_classical_replacement = use_classical_replacement
-
-        if self.use_quantum:
-            if qml is None:
-                raise ModuleNotFoundError('pennylane is required when --use_quantum True')
-            self.fc_in = nn.Linear(input_dim, n_qubits)
-            dev = qml.device("default.qubit", wires=n_qubits)
-
-            @qml.qnode(dev, interface='torch')
-            def quantum_circuit(inputs, weights):
-                qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
-                qml.templates.StronglyEntanglingLayers(weights, wires=range(n_qubits))
-                return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
-
-            weight_shapes = {"weights": (n_layers, n_qubits, 3)}
-            self.qlayer = qml.qnn.TorchLayer(quantum_circuit, weight_shapes)
-            self.fc_out = nn.Linear(n_qubits, output_dim)
-        elif self.use_classical_replacement:
-            self.classical_layer = nn.Sequential(
-                nn.Linear(input_dim, output_dim),
-                nn.ReLU(),
-                nn.Linear(output_dim, output_dim),
-            )
-
-    def forward(self, x):
-        if self.use_quantum:
-            x = self.fc_in(x)
-            x = self.qlayer(x)
-            return self.fc_out(x)
-        if self.use_classical_replacement:
-            return self.classical_layer(x)
-        return x
-
+        x = self.fc_in(x)
+        x = self.qlayer(x)
+        return self.fc_out(x)
 
 
 class Proj_eeg(nn.Sequential):
-    def __init__(self, embedding_dim=1440, proj_dim=768, drop_proj=0.5, n_qubits=10, n_layers=4,
-                 use_quantum=True, use_classical_replacement=False):
+    def __init__(self, embedding_dim=1440, proj_dim=768, drop_proj=0.5, n_qubits=10, n_layers=4):
         super().__init__(
             nn.Linear(embedding_dim, proj_dim),
             ResidualAdd(nn.Sequential(
@@ -203,12 +143,11 @@ class Proj_eeg(nn.Sequential):
                 nn.Dropout(drop_proj),
             )),
             nn.LayerNorm(proj_dim),
-            AblationQuantumLayer(n_qubits, n_layers, proj_dim, proj_dim, use_quantum, use_classical_replacement),
+            QuantumLayer(n_qubits, n_layers, proj_dim, proj_dim),
         )
 
 class Proj_img(nn.Sequential):
-    def __init__(self, embedding_dim=768, proj_dim=768, drop_proj=0.3, n_qubits=10, n_layers=4,
-                 use_quantum=True, use_classical_replacement=False):
+    def __init__(self, embedding_dim=768, proj_dim=768, drop_proj=0.3, n_qubits=10, n_layers=4):
         super().__init__(
             nn.Linear(embedding_dim, proj_dim),
             ResidualAdd(nn.Sequential(
@@ -217,7 +156,7 @@ class Proj_img(nn.Sequential):
                 nn.Dropout(drop_proj),
             )),
             nn.LayerNorm(proj_dim),
-            AblationQuantumLayer(n_qubits, n_layers, proj_dim, proj_dim, use_quantum, use_classical_replacement),
+            QuantumLayer(n_qubits, n_layers, proj_dim, proj_dim),
         )
     def forward(self, x):
         return x 
@@ -246,11 +185,6 @@ class IE():
         self.model_path = os.path.abspath(args.model_path) + os.sep
         os.makedirs(self.result_path, exist_ok=True)
         os.makedirs(self.model_path, exist_ok=True)
-        self.ablation_mode = get_ablation_mode(args)
-        print('Ablation mode:', self.ablation_mode,
-              'use_quantum:', args.use_quantum,
-              'use_contrastive:', args.use_contrastive,
-              'use_classical_replacement:', args.use_classical_replacement)
 
         self.start_epoch = 0
         self.eeg_data_path = os.path.join(local_path, 'Data', 'Things-EEG2', 'Preprocessed_data_250Hz') + os.sep
@@ -265,10 +199,8 @@ class IE():
         self.criterion_l1 = torch.nn.L1Loss().cuda()
         self.criterion_l2 = torch.nn.MSELoss().cuda()
         self.criterion_cls = torch.nn.CrossEntropyLoss().cuda()
-        self.Proj_eeg = Proj_eeg(use_quantum=args.use_quantum,
-                                 use_classical_replacement=args.use_classical_replacement).cuda()
-        self.Proj_img = Proj_img(use_quantum=args.use_quantum,
-                                 use_classical_replacement=args.use_classical_replacement).cuda()
+        self.Proj_eeg = Proj_eeg().cuda()
+        self.Proj_img = Proj_img().cuda()
         self.Proj_eeg = nn.DataParallel(self.Proj_eeg, device_ids=[i for i in range(len(gpus))])
         self.Proj_img = nn.DataParallel(self.Proj_img, device_ids=[i for i in range(len(gpus))])
 
@@ -425,11 +357,8 @@ class IE():
 
                 loss_cos = (loss_eeg + loss_img) / 2
 
-                if self.args.use_contrastive:
-                    # total loss SK-InfoNCE loss
-                    loss = loss_cos + eeg_img_cos_sim_loss
-                else:
-                    loss = self.criterion_cls(logits_per_eeg, labels)
+                # total loss SK-InfoNCE loss
+                loss = loss_cos + eeg_img_cos_sim_loss
 
                 # INfoNCE loss
                 # loss = loss_cos 
@@ -469,10 +398,7 @@ class IE():
                         vloss_eeg = self.criterion_cls(vlogits_per_eeg, vlabels)
                         vloss_img = self.criterion_cls(vlogits_per_img, vlabels)
 
-                        if self.args.use_contrastive:
-                            vloss = (vloss_eeg + vloss_img) / 2
-                        else:
-                            vloss = self.criterion_cls(vlogits_per_eeg, vlabels)
+                        vloss = (vloss_eeg + vloss_img) / 2
 
                         if vloss <= best_loss_val:
                             best_loss_val = vloss
@@ -541,24 +467,279 @@ class IE():
         self.log_write.write('The test Top1-%.6f, Top3-%.6f, Top5-%.6f\n' % (top1_acc, top3_acc, top5_acc))
         self.log_write.close()
 
-        ablation_row = pd.DataFrame([{
-            'time': datetime.datetime.now().isoformat(timespec='seconds'),
-            'subject': self.nSub,
-            'mode': self.ablation_mode,
-            'use_quantum': self.args.use_quantum,
-            'use_contrastive': self.args.use_contrastive,
-            'use_classical_replacement': self.args.use_classical_replacement,
-            'top1': top1_acc,
-            'top3': top3_acc,
-            'top5': top5_acc,
-            'best_epoch': best_epoch,
-            'epochs': self.n_epochs,
-            'dnn': self.args.dnn,
-        }])
-        ablation_csv = self.result_path + 'ablation_results.csv'
-        ablation_row.to_csv(ablation_csv, mode='a', header=not os.path.exists(ablation_csv), index=False)
-        
         return top1_acc, top3_acc, top5_acc
+
+
+def get_video_text_device(args):
+    if args.device == 'cpu':
+        return torch.device('cpu')
+    if args.device == 'cuda':
+        if not torch.cuda.is_available():
+            raise RuntimeError('--device cuda requested, but CUDA is not available')
+        return torch.device('cuda')
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def split_indices(num_items, val_ratio, test_ratio, seed):
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(num_items, generator=generator)
+    if num_items < 4:
+        return indices, indices[:0], indices
+
+    test_count = max(1, int(round(num_items * test_ratio)))
+    val_count = max(1, int(round(num_items * val_ratio)))
+    if test_count + val_count >= num_items:
+        test_count = max(1, num_items // 4)
+        val_count = max(1, num_items // 4)
+
+    test_idx = indices[:test_count]
+    val_idx = indices[test_count:test_count + val_count]
+    train_idx = indices[test_count + val_count:]
+    if len(train_idx) < 2:
+        train_idx = indices
+        val_idx = indices[:0]
+        test_idx = indices
+    return train_idx, val_idx, test_idx
+
+
+def compute_structure_loss(source_features, target_features):
+    source_norm = source_features / source_features.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    target_norm = target_features / target_features.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    source_similarity = torch.mm(source_norm, source_norm.t())
+    target_similarity = torch.mm(target_norm, target_norm.t())
+    cross_similarity = F.cosine_similarity(source_similarity, target_similarity)
+    return 1 - cross_similarity.mean()
+
+
+def retrieval_scores(logits, labels, topk=(1, 3, 5)):
+    max_k = min(max(topk), logits.shape[1])
+    _, indices = logits.topk(max_k, dim=1)
+    scores = {}
+    for k in topk:
+        effective_k = min(k, logits.shape[1])
+        scores[f'top{k}'] = (indices[:, :effective_k] == labels[:, None]).any(dim=1).float().mean().item()
+    return scores
+
+
+def evaluate_video_text(model, source_features, target_features, query_indices, gallery_indices, device):
+    model.eval()
+    with torch.no_grad():
+        query = source_features[query_indices].to(device)
+        gallery = target_features[gallery_indices].to(device)
+        query_embed = model(query)
+        query_embed = query_embed / query_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        gallery_embed = gallery / gallery.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        logits = 100.0 * query_embed @ gallery_embed.t()
+        labels = torch.arange(len(query_indices), device=device)
+        return retrieval_scores(logits, labels)
+
+
+def evaluate_video_text_both_directions(model, video_features, text_features, indices, device):
+    scores_v2t = evaluate_video_text(model, video_features, text_features, indices, indices, device)
+    model.eval()
+    with torch.no_grad():
+        text_query = text_features[indices].to(device)
+        video_gallery = video_features[indices].to(device)
+        video_gallery_embed = model(video_gallery)
+        video_gallery_embed = video_gallery_embed / video_gallery_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        text_query_embed = text_query / text_query.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        logits_t2v = 100.0 * text_query_embed @ video_gallery_embed.t()
+        labels = torch.arange(len(indices), device=device)
+        scores_t2v = retrieval_scores(logits_t2v, labels)
+    return scores_v2t, scores_t2v
+
+
+def train_video_text(args):
+    if not args.manifest:
+        raise ValueError('--manifest is required when --task video_text')
+
+    seed = args.seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    device = get_video_text_device(args)
+    result_dir = os.path.abspath(args.result_path)
+    model_dir = os.path.abspath(args.model_path)
+    os.makedirs(result_dir, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+
+    print('Task: video_text')
+    print('Using device:', device)
+    print('Using quantum:', args.use_quantum)
+    print('Feature backend:', args.feature_backend)
+    if args.feature_backend == 'clip':
+        print('CLIP model:', args.clip_model)
+    print('Manifest:', os.path.abspath(args.manifest))
+
+    extractor = VideoTextFeatureExtractor(
+        feature_dim=args.feature_dim,
+        num_frames=args.num_frames,
+        backend=args.feature_backend,
+        clip_model_name=args.clip_model,
+        device=device,
+        clip_batch_size=args.clip_batch_size,
+    )
+    video_features, text_features, decoded_paths = extractor.load_manifest(args.manifest)
+    print('Decoded video files:', len(decoded_paths))
+    print('Feature shapes video/text:', tuple(video_features.shape), tuple(text_features.shape))
+    if video_features.shape[1] != text_features.shape[1]:
+        raise ValueError(
+            'video_text expects video and text features in the same embedding dimension. '
+            f'Got video={video_features.shape[1]} text={text_features.shape[1]}.'
+        )
+
+    num_items = video_features.shape[0]
+    train_idx, val_idx, test_idx = split_indices(num_items, args.val_ratio, args.test_ratio, seed)
+    print('Split sizes train/val/test:', len(train_idx), len(val_idx), len(test_idx))
+
+    train_dataset = torch.utils.data.TensorDataset(video_features[train_idx], text_features[train_idx])
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+
+    model = Proj_video(
+        embedding_dim=video_features.shape[1],
+        proj_dim=text_features.shape[1],
+        n_qubits=args.n_qubits,
+        n_layers=args.n_layers,
+        use_quantum=args.use_quantum,
+    ).to(device)
+    model.apply(weights_init_normal)
+    logit_scale = nn.Parameter(torch.ones([], device=device) * np.log(1 / 0.07))
+    optimizer = torch.optim.AdamW(itertools.chain(model.parameters(), [logit_scale]), lr=args.lr, betas=(0.5, 0.999))
+    criterion_cls = nn.CrossEntropyLoss()
+
+    best_val_loss = np.inf
+    best_epoch = 0
+    best_val_scores = None
+    checkpoint_path = os.path.join(model_dir, 'video_text_Proj_video_quantum.pth' if args.use_quantum else 'video_text_Proj_video_classical.pth')
+    history = []
+
+    for epoch in range(args.epoch):
+        model.train()
+        epoch_loss = 0.0
+        epoch_batches = 0
+        for video_batch, text_batch in train_loader:
+            if video_batch.shape[0] < 2:
+                continue
+            video_batch = video_batch.to(device)
+            text_batch = text_batch.to(device)
+            labels = torch.arange(video_batch.shape[0], device=device)
+
+            video_embed = model(video_batch)
+            text_embed = text_batch
+            video_embed = video_embed / video_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            text_embed = text_embed / text_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
+
+            logits_per_video = logit_scale.exp() * video_embed @ text_embed.t()
+            logits_per_text = logits_per_video.t()
+            loss_video = criterion_cls(logits_per_video, labels)
+            loss_text = criterion_cls(logits_per_text, labels)
+            loss_cos = (loss_video + loss_text) / 2
+            structure_loss = compute_structure_loss(video_batch, text_batch)
+            loss = loss_cos + structure_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            epoch_batches += 1
+
+        model.eval()
+        with torch.no_grad():
+            if len(val_idx) >= 2:
+                val_video = video_features[val_idx].to(device)
+                val_text = text_features[val_idx].to(device)
+            else:
+                val_video = video_features[train_idx].to(device)
+                val_text = text_features[train_idx].to(device)
+            val_labels = torch.arange(val_video.shape[0], device=device)
+            val_video_embed = model(val_video)
+            val_text_embed = val_text
+            val_video_embed = val_video_embed / val_video_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            val_text_embed = val_text_embed / val_text_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
+            val_logits = logit_scale.exp() * val_video_embed @ val_text_embed.t()
+            val_loss = (criterion_cls(val_logits, val_labels) + criterion_cls(val_logits.t(), val_labels)) / 2
+
+        if val_loss.item() <= best_val_loss:
+            best_val_loss = val_loss.item()
+            best_epoch = epoch + 1
+            if len(val_idx) >= 1:
+                best_val_scores = evaluate_video_text_both_directions(model, video_features, text_features, val_idx, device)
+            torch.save({
+                'model': model.state_dict(),
+                'logit_scale': logit_scale.detach().cpu(),
+                'args': vars(args),
+            }, checkpoint_path)
+
+        if len(val_idx) >= 1:
+            scores_v2t, scores_t2v = evaluate_video_text_both_directions(model, video_features, text_features, val_idx, device)
+        else:
+            scores_v2t, scores_t2v = evaluate_video_text_both_directions(model, video_features, text_features, train_idx, device)
+
+        row = {
+            'epoch': epoch + 1,
+            'train_loss': epoch_loss / max(epoch_batches, 1),
+            'val_loss': val_loss.item(),
+            'val_video_to_text_top1': scores_v2t['top1'],
+            'val_video_to_text_top3': scores_v2t['top3'],
+            'val_video_to_text_top5': scores_v2t['top5'],
+            'val_text_to_video_top1': scores_t2v['top1'],
+            'val_text_to_video_top3': scores_t2v['top3'],
+            'val_text_to_video_top5': scores_t2v['top5'],
+            'use_quantum': args.use_quantum,
+        }
+        history.append(row)
+        print(
+            'Epoch %03d train_loss=%.4f val_loss=%.4f val_v2t_top1=%.4f val_t2v_top1=%.4f' %
+            (row['epoch'], row['train_loss'], row['val_loss'], row['val_video_to_text_top1'], row['val_text_to_video_top1'])
+        )
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model'])
+    if 'logit_scale' in checkpoint:
+        logit_scale.data = checkpoint['logit_scale'].to(device)
+    eval_idx = torch.arange(num_items) if args.eval_on_all else test_idx
+    test_scores_v2t, test_scores_t2v = evaluate_video_text_both_directions(model, video_features, text_features, eval_idx, device)
+
+    summary_row = {
+        'epoch': 'best_test',
+        'train_loss': np.nan,
+        'val_loss': best_val_loss,
+        'val_video_to_text_top1': best_val_scores[0]['top1'] if best_val_scores else np.nan,
+        'val_video_to_text_top3': best_val_scores[0]['top3'] if best_val_scores else np.nan,
+        'val_video_to_text_top5': best_val_scores[0]['top5'] if best_val_scores else np.nan,
+        'val_text_to_video_top1': best_val_scores[1]['top1'] if best_val_scores else np.nan,
+        'val_text_to_video_top3': best_val_scores[1]['top3'] if best_val_scores else np.nan,
+        'val_text_to_video_top5': best_val_scores[1]['top5'] if best_val_scores else np.nan,
+        'test_video_to_text_top1': test_scores_v2t['top1'],
+        'test_video_to_text_top3': test_scores_v2t['top3'],
+        'test_video_to_text_top5': test_scores_v2t['top5'],
+        'test_text_to_video_top1': test_scores_t2v['top1'],
+        'test_text_to_video_top3': test_scores_t2v['top3'],
+        'test_text_to_video_top5': test_scores_t2v['top5'],
+        'eval_on_all': args.eval_on_all,
+        'use_quantum': args.use_quantum,
+    }
+    history.append(summary_row)
+
+    result_csv = os.path.join(result_dir, 'video_text_results.csv')
+    pd.DataFrame(history).to_csv(result_csv, index=False)
+    print('The best epoch is:', best_epoch)
+    print(
+        'Best checkpoint test Top1/Top3/Top5: '
+        'v2t %.6f/%.6f/%.6f, t2v %.6f/%.6f/%.6f' %
+        (
+            test_scores_v2t['top1'], test_scores_v2t['top3'], test_scores_v2t['top5'],
+            test_scores_t2v['top1'], test_scores_t2v['top3'], test_scores_t2v['top5'],
+        )
+    )
+    print('Saved results to:', result_csv)
+    print('Saved checkpoint to:', checkpoint_path)
+    return test_scores_v2t['top1'], test_scores_t2v['top1'], best_val_loss
+
 
 def main():
     args = parser.parse_args()
@@ -567,7 +748,9 @@ def main():
     args.model_path = os.path.abspath(args.model_path)
     os.makedirs(args.result_path, exist_ok=True)
     os.makedirs(args.model_path, exist_ok=True)
-    print('Running mode:', get_ablation_mode(args))
+    if args.task == 'video_text':
+        train_video_text(args)
+        return
 
     num_sub = args.num_sub   
     
