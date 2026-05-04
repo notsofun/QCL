@@ -15,6 +15,8 @@ from einops import rearrange
 from torch_geometric.nn import GATConv
 import os
 import argparse
+import copy
+import hashlib
 import random
 import itertools
 import datetime
@@ -74,14 +76,37 @@ parser.add_argument('--proj_dim', default=768, type=int,
                     help='video_text projection/contrastive dimension')
 parser.add_argument('--num_frames', default=8, type=int,
                     help='number of video frames sampled for video_text features')
-parser.add_argument('--feature_backend', default='clip', choices=['clip', 'handcraft'],
-                    help='video_text feature extractor: CLIP frame/text embeddings or hand-crafted fallback')
+parser.add_argument('--feature_backend', default='clip_frame',
+                    choices=['clip', 'clip_frame', 'handcraft', 'video_encoder'],
+                    help='video_text feature extractor: CLIP frame/text embeddings, a future video encoder, or hand-crafted fallback')
+parser.add_argument('--video_pooling', default='mean',
+                    choices=['mean', 'mean_std', 'temporal_mlp', 'attention', 'temporal_attention'],
+                    help='video_text temporal pooling for CLIP frame features')
 parser.add_argument('--clip_model', default='openai/clip-vit-base-patch32', type=str,
                     help='Hugging Face CLIP model used when --feature_backend clip')
+parser.add_argument('--video_encoder_model', default='microsoft/xclip-base-patch32', type=str,
+                    help='Hugging Face video-text encoder used when --feature_backend video_encoder')
 parser.add_argument('--clip_batch_size', default=16, type=int,
                     help='batch size for CLIP frame encoding')
 parser.add_argument('--use_quantum', default=True, type=str2bool, nargs='?', const=True,
                     help='video_text: add the quantum layer to the video projection head')
+parser.add_argument('--projection_tail', default=None,
+                    choices=['identity', 'quantum', 'classical_bottleneck'],
+                    help='video_text projection tail. Defaults to quantum/identity from --use_quantum for backwards compatibility')
+parser.add_argument('--eval_identity_baseline', default=True, type=str2bool, nargs='?', const=True,
+                    help='video_text: evaluate frozen CLIP video-text retrieval without Proj_video')
+parser.add_argument('--structure_loss_weight', default=0.0, type=float,
+                    help='video_text weight for structure loss on projected embeddings')
+parser.add_argument('--train_text_projection', default=False, type=str2bool, nargs='?', const=True,
+                    help='video_text: train a small text-side projection head')
+parser.add_argument('--grad_accum_steps', default=1, type=int,
+                    help='video_text gradient accumulation steps')
+parser.add_argument('--cache_features', default=False, type=str2bool, nargs='?', const=True,
+                    help='video_text: cache extracted video/text features')
+parser.add_argument('--feature_cache_path', default=None, type=str,
+                    help='video_text feature cache path. Defaults under result_path when --cache_features true')
+parser.add_argument('--seeds', default=None, nargs='+', type=int,
+                    help='video_text: run multiple seeds and write an aggregate ablation summary')
 parser.add_argument('--n_qubits', default=10, type=int,
                     help='video_text quantum qubit count')
 parser.add_argument('--n_layers', default=4, type=int,
@@ -480,6 +505,82 @@ def get_video_text_device(args):
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+def resolve_projection_tail(args):
+    if args.projection_tail is not None:
+        return args.projection_tail
+    return 'quantum' if args.use_quantum else 'identity'
+
+
+def quantum_parameter_stats(model):
+    param_count = 0
+    grad_sq_sum = 0.0
+    has_grad = False
+    for name, param in model.named_parameters():
+        lowered = name.lower()
+        if 'qlayer' not in lowered and 'tail.tail.qlayer' not in lowered:
+            continue
+        param_count += param.numel()
+        if param.grad is not None:
+            grad_sq_sum += float(param.grad.detach().pow(2).sum().cpu())
+            has_grad = True
+    grad_norm = float(np.sqrt(grad_sq_sum)) if has_grad else 0.0
+    return param_count, grad_norm
+
+
+class TextProjectionHead(nn.Sequential):
+    def __init__(self, embedding_dim=768, proj_dim=768, drop_proj=0.3):
+        super().__init__(
+            nn.Linear(embedding_dim, proj_dim),
+            ResidualAdd(nn.Sequential(
+                nn.GELU(),
+                nn.Linear(proj_dim, proj_dim),
+                nn.Dropout(drop_proj),
+            )),
+            nn.LayerNorm(proj_dim),
+        )
+
+
+class TemporalVideoProjection(nn.Module):
+    def __init__(self, frame_dim=768, proj_dim=768, video_pooling='temporal_mlp',
+                 drop_proj=0.3, n_qubits=10, n_layers=4, projection_tail='identity'):
+        super().__init__()
+        self.video_pooling = video_pooling
+        if video_pooling == 'temporal_mlp':
+            self.temporal = nn.GRU(frame_dim, frame_dim, batch_first=True)
+            self.attention = None
+        elif video_pooling in {'attention', 'temporal_attention'}:
+            self.temporal = None
+            self.attention = nn.Sequential(
+                nn.LayerNorm(frame_dim),
+                nn.Linear(frame_dim, 1),
+            )
+        else:
+            self.temporal = None
+            self.attention = None
+        self.projection = Proj_video(
+            embedding_dim=frame_dim,
+            proj_dim=proj_dim,
+            drop_proj=drop_proj,
+            n_qubits=n_qubits,
+            n_layers=n_layers,
+            use_quantum=(projection_tail == 'quantum'),
+            projection_tail=projection_tail,
+        )
+
+    def forward(self, x):
+        if x.dim() != 3:
+            return self.projection(x)
+        if self.video_pooling == 'temporal_mlp':
+            temporal_out, _ = self.temporal(x)
+            pooled = temporal_out.mean(dim=1)
+        elif self.video_pooling in {'attention', 'temporal_attention'}:
+            weights = torch.softmax(self.attention(x).squeeze(-1), dim=1)
+            pooled = torch.sum(x * weights.unsqueeze(-1), dim=1)
+        else:
+            pooled = x.mean(dim=1)
+        return self.projection(pooled)
+
+
 def split_indices(num_items, val_ratio, test_ratio, seed):
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randperm(num_items, generator=generator)
@@ -521,38 +622,145 @@ def retrieval_scores(logits, labels, topk=(1, 3, 5)):
     return scores
 
 
-def evaluate_video_text(model, source_features, target_features, query_indices, gallery_indices, device):
+def random_retrieval_scores(num_gallery, topk=(1, 3, 5)):
+    if num_gallery <= 0:
+        return {f'top{k}': np.nan for k in topk}
+    return {f'top{k}': min(k, num_gallery) / num_gallery for k in topk}
+
+
+def normalize_features(features):
+    return features / features.norm(dim=1, keepdim=True).clamp_min(1e-8)
+
+
+def maybe_project_text(text_model, text_features):
+    if text_model is None:
+        return text_features
+    return text_model(text_features)
+
+
+def identity_video_features(video_features, text_dim):
+    if video_features.dim() == 3:
+        return video_features.mean(dim=1)
+    if video_features.shape[1] == text_dim:
+        return video_features
+    if video_features.shape[1] >= text_dim:
+        return video_features[:, :text_dim]
+    return None
+
+
+def evaluate_identity_video_text(video_features, text_features, indices, device):
+    video_identity = identity_video_features(video_features, text_features.shape[1])
+    if video_identity is None or len(indices) < 1:
+        nan_scores = {'top1': np.nan, 'top3': np.nan, 'top5': np.nan}
+        return nan_scores, nan_scores
+    with torch.no_grad():
+        video_embed = normalize_features(video_identity[indices].to(device))
+        text_embed = normalize_features(text_features[indices].to(device))
+        labels = torch.arange(len(indices), device=device)
+        logits_v2t = 100.0 * video_embed @ text_embed.t()
+        logits_t2v = logits_v2t.t()
+        return retrieval_scores(logits_v2t, labels), retrieval_scores(logits_t2v, labels)
+
+
+def evaluate_video_text(model, text_model, source_features, target_features, query_indices, gallery_indices, device):
     model.eval()
+    if text_model is not None:
+        text_model.eval()
     with torch.no_grad():
         query = source_features[query_indices].to(device)
         gallery = target_features[gallery_indices].to(device)
         query_embed = model(query)
-        query_embed = query_embed / query_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        gallery_embed = gallery / gallery.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        gallery_embed = maybe_project_text(text_model, gallery)
+        query_embed = normalize_features(query_embed)
+        gallery_embed = normalize_features(gallery_embed)
         logits = 100.0 * query_embed @ gallery_embed.t()
         labels = torch.arange(len(query_indices), device=device)
         return retrieval_scores(logits, labels)
 
 
-def evaluate_video_text_both_directions(model, video_features, text_features, indices, device):
-    scores_v2t = evaluate_video_text(model, video_features, text_features, indices, indices, device)
+def evaluate_video_text_both_directions(model, text_model, video_features, text_features, indices, device):
+    scores_v2t = evaluate_video_text(model, text_model, video_features, text_features, indices, indices, device)
     model.eval()
+    if text_model is not None:
+        text_model.eval()
     with torch.no_grad():
         text_query = text_features[indices].to(device)
         video_gallery = video_features[indices].to(device)
         video_gallery_embed = model(video_gallery)
-        video_gallery_embed = video_gallery_embed / video_gallery_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        text_query_embed = text_query / text_query.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        text_query_embed = maybe_project_text(text_model, text_query)
+        video_gallery_embed = normalize_features(video_gallery_embed)
+        text_query_embed = normalize_features(text_query_embed)
         logits_t2v = 100.0 * text_query_embed @ video_gallery_embed.t()
         labels = torch.arange(len(indices), device=device)
         scores_t2v = retrieval_scores(logits_t2v, labels)
     return scores_v2t, scores_t2v
 
 
+def compute_video_text_losses(video_model, text_model, video_batch, text_batch, logit_scale,
+                              criterion_cls, structure_loss_weight):
+    labels = torch.arange(video_batch.shape[0], device=video_batch.device)
+    video_embed = video_model(video_batch)
+    text_embed = maybe_project_text(text_model, text_batch)
+    video_embed = normalize_features(video_embed)
+    text_embed = normalize_features(text_embed)
+
+    logits_per_video = logit_scale.exp() * video_embed @ text_embed.t()
+    logits_per_text = logits_per_video.t()
+    loss_video = criterion_cls(logits_per_video, labels)
+    loss_text = criterion_cls(logits_per_text, labels)
+    contrastive_loss = (loss_video + loss_text) / 2
+    structure_loss = compute_structure_loss(video_embed, text_embed)
+    total_loss = contrastive_loss + structure_loss_weight * structure_loss
+    return total_loss, contrastive_loss, structure_loss
+
+
+def manifest_file_hash(manifest_path):
+    hasher = hashlib.sha256()
+    with open(manifest_path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def load_or_extract_video_text_features(args, extractor, device):
+    manifest_hash = manifest_file_hash(args.manifest)
+    cache_path = args.feature_cache_path
+    if cache_path is None:
+        cache_path = os.path.join(args.result_path, 'video_text_feature_cache.pt')
+    metadata = {
+        'manifest_hash': manifest_hash,
+        'clip_model': args.clip_model,
+        'video_encoder_model': args.video_encoder_model,
+        'num_frames': args.num_frames,
+        'feature_backend': 'clip_frame' if args.feature_backend == 'clip' else args.feature_backend,
+        'video_pooling': args.video_pooling,
+    }
+    if args.cache_features and os.path.exists(cache_path):
+        cache = torch.load(cache_path, map_location='cpu')
+        if all(cache.get(key) == value for key, value in metadata.items()):
+            print('Loaded feature cache:', os.path.abspath(cache_path))
+            return cache['video_features'], cache['text_features'], cache['decoded_paths']
+        print('Ignoring stale feature cache:', os.path.abspath(cache_path))
+
+    video_features, text_features, decoded_paths = extractor.load_manifest(args.manifest)
+    if args.cache_features:
+        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+        torch.save({
+            'video_features': video_features.cpu(),
+            'text_features': text_features.cpu(),
+            'decoded_paths': decoded_paths,
+            **metadata,
+        }, cache_path)
+        print('Saved feature cache:', os.path.abspath(cache_path))
+    return video_features, text_features, decoded_paths
+
+
 def train_video_text(args):
     if not args.manifest:
         raise ValueError('--manifest is required when --task video_text')
 
+    args.grad_accum_steps = max(1, int(args.grad_accum_steps))
+    projection_tail = resolve_projection_tail(args)
     seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
@@ -569,10 +777,14 @@ def train_video_text(args):
 
     print('Task: video_text')
     print('Using device:', device)
-    print('Using quantum:', args.use_quantum)
+    print('Projection tail:', projection_tail)
     print('Feature backend:', args.feature_backend)
-    if args.feature_backend == 'clip':
+    print('Video pooling:', args.video_pooling)
+    print('Train text projection:', args.train_text_projection)
+    if args.feature_backend in {'clip', 'clip_frame'}:
         print('CLIP model:', args.clip_model)
+    if args.feature_backend == 'video_encoder':
+        print('Video encoder model:', args.video_encoder_model)
     print('Manifest:', os.path.abspath(args.manifest))
 
     extractor = VideoTextFeatureExtractor(
@@ -582,15 +794,16 @@ def train_video_text(args):
         clip_model_name=args.clip_model,
         device=device,
         clip_batch_size=args.clip_batch_size,
+        video_pooling=args.video_pooling,
+        video_encoder_model_name=args.video_encoder_model,
     )
-    video_features, text_features, decoded_paths = extractor.load_manifest(args.manifest)
+    video_features, text_features, decoded_paths = load_or_extract_video_text_features(args, extractor, device)
     print('Decoded video files:', len(decoded_paths))
     print('Feature shapes video/text:', tuple(video_features.shape), tuple(text_features.shape))
-    if video_features.shape[1] != text_features.shape[1]:
-        raise ValueError(
-            'video_text expects video and text features in the same embedding dimension. '
-            f'Got video={video_features.shape[1]} text={text_features.shape[1]}.'
-        )
+    if video_features.dim() not in {2, 3}:
+        raise ValueError(f'video_text expects 2D or 3D video features, got {video_features.dim()}D')
+    video_input_dim = video_features.shape[-1] if video_features.dim() == 3 else video_features.shape[1]
+    text_dim = text_features.shape[1]
 
     num_items = video_features.shape[0]
     train_idx, val_idx, test_idx = split_indices(num_items, args.val_ratio, args.test_ratio, seed)
@@ -599,55 +812,99 @@ def train_video_text(args):
     train_dataset = torch.utils.data.TensorDataset(video_features[train_idx], text_features[train_idx])
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 
-    model = Proj_video(
-        embedding_dim=video_features.shape[1],
-        proj_dim=text_features.shape[1],
-        n_qubits=args.n_qubits,
-        n_layers=args.n_layers,
-        use_quantum=args.use_quantum,
-    ).to(device)
+    if video_features.dim() == 3:
+        model = TemporalVideoProjection(
+            frame_dim=video_input_dim,
+            proj_dim=text_dim,
+            video_pooling=args.video_pooling,
+            n_qubits=args.n_qubits,
+            n_layers=args.n_layers,
+            projection_tail=projection_tail,
+        ).to(device)
+    else:
+        model = Proj_video(
+            embedding_dim=video_input_dim,
+            proj_dim=text_dim,
+            n_qubits=args.n_qubits,
+            n_layers=args.n_layers,
+            use_quantum=(projection_tail == 'quantum'),
+            projection_tail=projection_tail,
+        ).to(device)
     model.apply(weights_init_normal)
+    quantum_param_count, _ = quantum_parameter_stats(model)
+    if projection_tail == 'quantum' and quantum_param_count == 0:
+        raise RuntimeError('projection_tail=quantum was requested, but no qlayer parameters were found.')
+    text_model = None
+    if args.train_text_projection:
+        text_model = TextProjectionHead(embedding_dim=text_dim, proj_dim=text_dim).to(device)
+        text_model.apply(weights_init_normal)
+
     logit_scale = nn.Parameter(torch.ones([], device=device) * np.log(1 / 0.07))
-    optimizer = torch.optim.AdamW(itertools.chain(model.parameters(), [logit_scale]), lr=args.lr, betas=(0.5, 0.999))
+    optim_params = list(model.parameters()) + [logit_scale]
+    if text_model is not None:
+        optim_params += list(text_model.parameters())
+    optimizer = torch.optim.AdamW(optim_params, lr=args.lr, betas=(0.5, 0.999))
     criterion_cls = nn.CrossEntropyLoss()
 
     best_val_loss = np.inf
     best_epoch = 0
     best_val_scores = None
-    checkpoint_path = os.path.join(model_dir, 'video_text_Proj_video_quantum.pth' if args.use_quantum else 'video_text_Proj_video_classical.pth')
+    checkpoint_name = f"video_text_Proj_video_{projection_tail}_{args.video_pooling}"
+    if args.train_text_projection:
+        checkpoint_name += "_dual"
+    checkpoint_path = os.path.join(model_dir, checkpoint_name + '.pth')
     history = []
 
     for epoch in range(args.epoch):
         model.train()
-        epoch_loss = 0.0
+        if text_model is not None:
+            text_model.train()
+        epoch_total_loss = 0.0
+        epoch_contrastive_loss = 0.0
+        epoch_structure_loss = 0.0
         epoch_batches = 0
+        accum_counter = 0
+        max_quantum_grad_norm = 0.0
+        optimizer.zero_grad()
         for video_batch, text_batch in train_loader:
             if video_batch.shape[0] < 2:
                 continue
             video_batch = video_batch.to(device)
             text_batch = text_batch.to(device)
-            labels = torch.arange(video_batch.shape[0], device=device)
 
-            video_embed = model(video_batch)
-            text_embed = text_batch
-            video_embed = video_embed / video_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
-            text_embed = text_embed / text_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
-
-            logits_per_video = logit_scale.exp() * video_embed @ text_embed.t()
-            logits_per_text = logits_per_video.t()
-            loss_video = criterion_cls(logits_per_video, labels)
-            loss_text = criterion_cls(logits_per_text, labels)
-            loss_cos = (loss_video + loss_text) / 2
-            structure_loss = compute_structure_loss(video_batch, text_batch)
-            loss = loss_cos + structure_loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
+            total_loss, contrastive_loss, structure_loss = compute_video_text_losses(
+                model,
+                text_model,
+                video_batch,
+                text_batch,
+                logit_scale,
+                criterion_cls,
+                args.structure_loss_weight,
+            )
+            (total_loss / args.grad_accum_steps).backward()
+            _, quantum_grad_norm = quantum_parameter_stats(model)
+            max_quantum_grad_norm = max(max_quantum_grad_norm, quantum_grad_norm)
+            accum_counter += 1
+            if accum_counter % args.grad_accum_steps == 0:
+                optimizer.step()
+                logit_scale.data.clamp_(max=np.log(100.0))
+                optimizer.zero_grad()
+            epoch_total_loss += total_loss.item()
+            epoch_contrastive_loss += contrastive_loss.item()
+            epoch_structure_loss += structure_loss.item()
             epoch_batches += 1
+        if projection_tail == 'quantum' and epoch_batches > 0 and max_quantum_grad_norm <= 0.0:
+            raise RuntimeError(
+                'projection_tail=quantum was requested, but quantum circuit parameters received zero gradient.'
+            )
+        if accum_counter > 0 and accum_counter % args.grad_accum_steps != 0:
+            optimizer.step()
+            logit_scale.data.clamp_(max=np.log(100.0))
+            optimizer.zero_grad()
 
         model.eval()
+        if text_model is not None:
+            text_model.eval()
         with torch.no_grad():
             if len(val_idx) >= 2:
                 val_video = video_features[val_idx].to(device)
@@ -655,59 +912,111 @@ def train_video_text(args):
             else:
                 val_video = video_features[train_idx].to(device)
                 val_text = text_features[train_idx].to(device)
-            val_labels = torch.arange(val_video.shape[0], device=device)
-            val_video_embed = model(val_video)
-            val_text_embed = val_text
-            val_video_embed = val_video_embed / val_video_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
-            val_text_embed = val_text_embed / val_text_embed.norm(dim=1, keepdim=True).clamp_min(1e-8)
-            val_logits = logit_scale.exp() * val_video_embed @ val_text_embed.t()
-            val_loss = (criterion_cls(val_logits, val_labels) + criterion_cls(val_logits.t(), val_labels)) / 2
+            val_total_loss, val_contrastive_loss, val_structure_loss = compute_video_text_losses(
+                model,
+                text_model,
+                val_video,
+                val_text,
+                logit_scale,
+                criterion_cls,
+                args.structure_loss_weight,
+            )
 
-        if val_loss.item() <= best_val_loss:
-            best_val_loss = val_loss.item()
+        if val_total_loss.item() <= best_val_loss:
+            best_val_loss = val_total_loss.item()
             best_epoch = epoch + 1
             if len(val_idx) >= 1:
-                best_val_scores = evaluate_video_text_both_directions(model, video_features, text_features, val_idx, device)
+                best_val_scores = evaluate_video_text_both_directions(model, text_model, video_features, text_features, val_idx, device)
             torch.save({
                 'model': model.state_dict(),
+                'text_model': text_model.state_dict() if text_model is not None else None,
                 'logit_scale': logit_scale.detach().cpu(),
                 'args': vars(args),
+                'projection_tail': projection_tail,
             }, checkpoint_path)
 
         if len(val_idx) >= 1:
-            scores_v2t, scores_t2v = evaluate_video_text_both_directions(model, video_features, text_features, val_idx, device)
+            eval_val_idx = val_idx
         else:
-            scores_v2t, scores_t2v = evaluate_video_text_both_directions(model, video_features, text_features, train_idx, device)
+            eval_val_idx = train_idx
+        scores_v2t, scores_t2v = evaluate_video_text_both_directions(model, text_model, video_features, text_features, eval_val_idx, device)
+        random_scores = random_retrieval_scores(len(eval_val_idx))
+        identity_v2t, identity_t2v = evaluate_identity_video_text(video_features, text_features, eval_val_idx, device) if args.eval_identity_baseline else ({'top1': np.nan, 'top3': np.nan, 'top5': np.nan}, {'top1': np.nan, 'top3': np.nan, 'top5': np.nan})
+        scale_value = logit_scale.exp().item()
 
         row = {
             'epoch': epoch + 1,
-            'train_loss': epoch_loss / max(epoch_batches, 1),
-            'val_loss': val_loss.item(),
+            'train_contrastive_loss': epoch_contrastive_loss / max(epoch_batches, 1),
+            'train_structure_loss': epoch_structure_loss / max(epoch_batches, 1),
+            'train_total_loss': epoch_total_loss / max(epoch_batches, 1),
+            'val_contrastive_loss': val_contrastive_loss.item(),
+            'val_structure_loss': val_structure_loss.item(),
+            'val_total_loss': val_total_loss.item(),
             'val_video_to_text_top1': scores_v2t['top1'],
             'val_video_to_text_top3': scores_v2t['top3'],
             'val_video_to_text_top5': scores_v2t['top5'],
             'val_text_to_video_top1': scores_t2v['top1'],
             'val_text_to_video_top3': scores_t2v['top3'],
             'val_text_to_video_top5': scores_t2v['top5'],
+            'identity_video_to_text_top1': identity_v2t['top1'],
+            'identity_video_to_text_top3': identity_v2t['top3'],
+            'identity_video_to_text_top5': identity_v2t['top5'],
+            'identity_text_to_video_top1': identity_t2v['top1'],
+            'identity_text_to_video_top3': identity_t2v['top3'],
+            'identity_text_to_video_top5': identity_t2v['top5'],
+            'random_top1': random_scores['top1'],
+            'random_top3': random_scores['top3'],
+            'random_top5': random_scores['top5'],
+            'logit_scale': scale_value,
+            'temperature': 1.0 / scale_value,
+            'quantum_active': projection_tail == 'quantum',
+            'quantum_param_count': quantum_param_count,
+            'quantum_grad_norm': max_quantum_grad_norm if projection_tail == 'quantum' else np.nan,
+            'num_total': num_items,
+            'num_train': len(train_idx),
+            'num_val': len(val_idx),
+            'num_test': len(test_idx),
+            'seed': seed,
+            'batch_size': args.batch_size,
+            'lr': args.lr,
+            'best_epoch': best_epoch,
+            'projection_tail': projection_tail,
             'use_quantum': args.use_quantum,
+            'structure_loss_weight': args.structure_loss_weight,
+            'grad_accum_steps': args.grad_accum_steps,
+            'video_pooling': args.video_pooling,
+            'num_frames': args.num_frames,
+            'feature_backend': 'clip_frame' if args.feature_backend == 'clip' else args.feature_backend,
+            'clip_model': args.clip_model,
+            'video_encoder_model': args.video_encoder_model,
+            'train_text_projection': args.train_text_projection,
         }
         history.append(row)
         print(
-            'Epoch %03d train_loss=%.4f val_loss=%.4f val_v2t_top1=%.4f val_t2v_top1=%.4f' %
-            (row['epoch'], row['train_loss'], row['val_loss'], row['val_video_to_text_top1'], row['val_text_to_video_top1'])
+            'Epoch %03d train_total=%.4f val_total=%.4f val_v2t_top1=%.4f val_t2v_top1=%.4f scale=%.3f' %
+            (row['epoch'], row['train_total_loss'], row['val_total_loss'], row['val_video_to_text_top1'], row['val_text_to_video_top1'], row['logit_scale'])
         )
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model'])
+    if text_model is not None and checkpoint.get('text_model') is not None:
+        text_model.load_state_dict(checkpoint['text_model'])
     if 'logit_scale' in checkpoint:
         logit_scale.data = checkpoint['logit_scale'].to(device)
     eval_idx = torch.arange(num_items) if args.eval_on_all else test_idx
-    test_scores_v2t, test_scores_t2v = evaluate_video_text_both_directions(model, video_features, text_features, eval_idx, device)
+    test_scores_v2t, test_scores_t2v = evaluate_video_text_both_directions(model, text_model, video_features, text_features, eval_idx, device)
+    identity_test_v2t, identity_test_t2v = evaluate_identity_video_text(video_features, text_features, eval_idx, device) if args.eval_identity_baseline else ({'top1': np.nan, 'top3': np.nan, 'top5': np.nan}, {'top1': np.nan, 'top3': np.nan, 'top5': np.nan})
+    random_scores = random_retrieval_scores(len(eval_idx))
+    scale_value = logit_scale.exp().item()
 
     summary_row = {
         'epoch': 'best_test',
-        'train_loss': np.nan,
-        'val_loss': best_val_loss,
+        'train_contrastive_loss': np.nan,
+        'train_structure_loss': np.nan,
+        'train_total_loss': np.nan,
+        'val_contrastive_loss': np.nan,
+        'val_structure_loss': np.nan,
+        'val_total_loss': best_val_loss,
         'val_video_to_text_top1': best_val_scores[0]['top1'] if best_val_scores else np.nan,
         'val_video_to_text_top3': best_val_scores[0]['top3'] if best_val_scores else np.nan,
         'val_video_to_text_top5': best_val_scores[0]['top5'] if best_val_scores else np.nan,
@@ -720,8 +1029,45 @@ def train_video_text(args):
         'test_text_to_video_top1': test_scores_t2v['top1'],
         'test_text_to_video_top3': test_scores_t2v['top3'],
         'test_text_to_video_top5': test_scores_t2v['top5'],
+        'identity_v2t_top1': identity_test_v2t['top1'],
+        'identity_v2t_top3': identity_test_v2t['top3'],
+        'identity_v2t_top5': identity_test_v2t['top5'],
+        'identity_t2v_top1': identity_test_t2v['top1'],
+        'identity_t2v_top3': identity_test_t2v['top3'],
+        'identity_t2v_top5': identity_test_t2v['top5'],
+        'identity_video_to_text_top1': identity_test_v2t['top1'],
+        'identity_video_to_text_top3': identity_test_v2t['top3'],
+        'identity_video_to_text_top5': identity_test_v2t['top5'],
+        'identity_text_to_video_top1': identity_test_t2v['top1'],
+        'identity_text_to_video_top3': identity_test_t2v['top3'],
+        'identity_text_to_video_top5': identity_test_t2v['top5'],
+        'random_top1': random_scores['top1'],
+        'random_top3': random_scores['top3'],
+        'random_top5': random_scores['top5'],
+        'logit_scale': scale_value,
+            'temperature': 1.0 / scale_value,
+            'quantum_active': projection_tail == 'quantum',
+            'quantum_param_count': quantum_param_count,
+            'quantum_grad_norm': np.nan,
+            'num_total': num_items,
+        'num_train': len(train_idx),
+        'num_val': len(val_idx),
+        'num_test': len(test_idx),
+        'seed': seed,
+        'batch_size': args.batch_size,
+        'lr': args.lr,
+        'best_epoch': best_epoch,
+        'projection_tail': projection_tail,
         'eval_on_all': args.eval_on_all,
         'use_quantum': args.use_quantum,
+        'structure_loss_weight': args.structure_loss_weight,
+        'grad_accum_steps': args.grad_accum_steps,
+        'video_pooling': args.video_pooling,
+        'num_frames': args.num_frames,
+        'feature_backend': 'clip_frame' if args.feature_backend == 'clip' else args.feature_backend,
+        'clip_model': args.clip_model,
+        'video_encoder_model': args.video_encoder_model,
+        'train_text_projection': args.train_text_projection,
     }
     history.append(summary_row)
 
@@ -738,7 +1084,7 @@ def train_video_text(args):
     )
     print('Saved results to:', result_csv)
     print('Saved checkpoint to:', checkpoint_path)
-    return test_scores_v2t['top1'], test_scores_t2v['top1'], best_val_loss
+    return summary_row
 
 
 def main():
@@ -749,7 +1095,45 @@ def main():
     os.makedirs(args.result_path, exist_ok=True)
     os.makedirs(args.model_path, exist_ok=True)
     if args.task == 'video_text':
-        train_video_text(args)
+        if args.seeds:
+            base_result_path = args.result_path
+            base_model_path = args.model_path
+            summaries = []
+            for seed in args.seeds:
+                seed_args = copy.deepcopy(args)
+                seed_args.seed = seed
+                seed_args.seeds = None
+                seed_args.result_path = os.path.join(base_result_path, f'seed_{seed}')
+                seed_args.model_path = os.path.join(base_model_path, f'seed_{seed}')
+                os.makedirs(seed_args.result_path, exist_ok=True)
+                os.makedirs(seed_args.model_path, exist_ok=True)
+                summaries.append(train_video_text(seed_args))
+
+            summary_df = pd.DataFrame(summaries)
+            metric_columns = [
+                'test_video_to_text_top1', 'test_video_to_text_top3', 'test_video_to_text_top5',
+                'test_text_to_video_top1', 'test_text_to_video_top3', 'test_text_to_video_top5',
+                'identity_v2t_top1', 'identity_v2t_top3', 'identity_v2t_top5',
+                'identity_t2v_top1', 'identity_t2v_top3', 'identity_t2v_top5',
+            ]
+            aggregate = {}
+            for column in metric_columns:
+                if column in summary_df:
+                    aggregate[f'mean_{column}'] = summary_df[column].mean()
+                    aggregate[f'std_{column}'] = summary_df[column].std(ddof=0)
+            for column in [
+                'projection_tail', 'video_pooling', 'num_frames', 'feature_backend',
+                'clip_model', 'video_encoder_model', 'train_text_projection', 'batch_size',
+                'lr', 'num_total', 'num_train', 'num_val', 'num_test'
+            ]:
+                if column in summary_df:
+                    aggregate[column] = summary_df[column].iloc[0]
+            aggregate['seeds'] = ' '.join(str(seed) for seed in args.seeds)
+            summary_path = os.path.join(base_result_path, 'video_text_ablation_summary.csv')
+            pd.DataFrame([aggregate]).to_csv(summary_path, index=False)
+            print('Saved multi-seed summary to:', summary_path)
+        else:
+            train_video_text(args)
         return
 
     num_sub = args.num_sub   

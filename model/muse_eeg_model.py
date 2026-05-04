@@ -255,7 +255,7 @@ class QuantumLayer(nn.Module):
 
     def forward(self, x):
         if self.use_quantum:
-            x = self.fc_in(x)
+            x = torch.tanh(self.fc_in(x)) * np.pi
             x = self.qlayer(x)
             return self.fc_out(x)
         if self.use_classical_replacement:
@@ -312,17 +312,24 @@ def _pad_or_trim(array, dim):
 class VideoTextFeatureExtractor:
     def __init__(self, feature_dim=768, num_frames=8, backend="clip",
                  clip_model_name="openai/clip-vit-base-patch32", device="cpu",
-                 clip_batch_size=16):
+                 clip_batch_size=16, video_pooling="mean",
+                 video_encoder_model_name="microsoft/xclip-base-patch32"):
         self.feature_dim = feature_dim
         self.num_frames = num_frames
-        self.backend = backend
+        self.backend = "clip_frame" if backend == "clip" else backend
         self.clip_model_name = clip_model_name
+        self.video_encoder_model_name = video_encoder_model_name
         self.device = torch.device(device)
         self.clip_batch_size = clip_batch_size
+        self.video_pooling = video_pooling
         self.clip_model = None
         self.clip_processor = None
-        if self.backend == "clip":
+        self.video_encoder_model = None
+        self.video_encoder_processor = None
+        if self.backend == "clip_frame":
             self._load_clip()
+        if self.backend == "video_encoder":
+            self._load_video_encoder()
 
     def _load_clip(self):
         try:
@@ -339,8 +346,21 @@ class VideoTextFeatureExtractor:
         self.clip_model.eval()
         self.clip_processor = CLIPProcessor.from_pretrained(self.clip_model_name)
 
+    def _load_video_encoder(self):
+        try:
+            from transformers import XCLIPModel, XCLIPProcessor
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not import transformers XCLIP. Install a recent transformers "
+                "version, then use --feature_backend video_encoder."
+            ) from exc
+
+        self.video_encoder_model = XCLIPModel.from_pretrained(self.video_encoder_model_name).to(self.device)
+        self.video_encoder_model.eval()
+        self.video_encoder_processor = XCLIPProcessor.from_pretrained(self.video_encoder_model_name)
+
     def text_features(self, text):
-        if self.backend == "clip":
+        if self.backend == "clip_frame":
             inputs = self.clip_processor(
                 text=[str(text)],
                 return_tensors="pt",
@@ -350,6 +370,22 @@ class VideoTextFeatureExtractor:
             inputs = {key: value.to(self.device) for key, value in inputs.items()}
             with torch.no_grad():
                 features = self.clip_model.get_text_features(**inputs)
+            features = F.normalize(features, dim=1)
+            return features.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        if self.backend == "video_encoder":
+            inputs = self.video_encoder_processor(
+                text=[str(text)],
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            )
+            text_inputs = {
+                key: value.to(self.device)
+                for key, value in inputs.items()
+                if key in {"input_ids", "attention_mask", "position_ids"}
+            }
+            with torch.no_grad():
+                features = self.video_encoder_model.get_text_features(**text_inputs)
             features = F.normalize(features, dim=1)
             return features.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
@@ -404,7 +440,7 @@ class VideoTextFeatureExtractor:
             raise ValueError(f"OpenCV opened but decoded no frames: {video_path}")
         return frames
 
-    def _clip_video_features(self, video_path):
+    def _clip_frame_features(self, video_path):
         frames = self._sample_video_frames(video_path)
         images = [
             Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -419,13 +455,47 @@ class VideoTextFeatureExtractor:
                 features = self.clip_model.get_image_features(**inputs)
             frame_features.append(features)
         features = torch.cat(frame_features, dim=0)
-        features = F.normalize(features, dim=1).mean(dim=0, keepdim=True)
+        features = F.normalize(features, dim=1)
+        return features.detach().cpu()
+
+    def _clip_video_features(self, video_path):
+        frame_features = self._clip_frame_features(video_path)
+        if self.video_pooling == "mean":
+            features = frame_features.mean(dim=0, keepdim=True)
+            features = F.normalize(features, dim=1)
+            return features.squeeze(0).numpy().astype(np.float32)
+        if self.video_pooling == "mean_std":
+            mean = frame_features.mean(dim=0)
+            std = frame_features.std(dim=0, unbiased=False)
+            return torch.cat([mean, std], dim=0).numpy().astype(np.float32)
+        if self.video_pooling in {"temporal_mlp", "attention", "temporal_attention"}:
+            return frame_features.numpy().astype(np.float32)
+        raise ValueError(f"Unknown video_pooling: {self.video_pooling}")
+
+    def _xclip_video_features(self, video_path):
+        frames = self._sample_video_frames(video_path)
+        rgb_frames = [
+            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            for frame in frames
+        ]
+        try:
+            inputs = self.video_encoder_processor(videos=[rgb_frames], return_tensors="pt")
+        except Exception:
+            inputs = self.video_encoder_processor(videos=rgb_frames, return_tensors="pt")
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        pixel_values = inputs["pixel_values"]
+        if pixel_values.dim() == 4:
+            pixel_values = pixel_values.unsqueeze(0)
+        with torch.no_grad():
+            features = self.video_encoder_model.get_video_features(pixel_values=pixel_values)
         features = F.normalize(features, dim=1)
         return features.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
     def video_features(self, video_path):
-        if self.backend == "clip":
+        if self.backend == "clip_frame":
             return self._clip_video_features(video_path)
+        if self.backend == "video_encoder":
+            return self._xclip_video_features(video_path)
 
         frames = self._sample_video_frames(video_path)
         stats = []
@@ -474,7 +544,9 @@ class VideoTextFeatureExtractor:
 
 class Proj_video(nn.Sequential):
     def __init__(self, embedding_dim=768, proj_dim=768, drop_proj=0.3, n_qubits=10, n_layers=4,
-                 use_quantum=True):
+                 use_quantum=True, projection_tail=None):
+        if projection_tail is None:
+            projection_tail = "quantum" if use_quantum else "identity"
         super().__init__(
             nn.Linear(embedding_dim, proj_dim),
             ResidualAdd(nn.Sequential(
@@ -483,5 +555,28 @@ class Proj_video(nn.Sequential):
                 nn.Dropout(drop_proj),
             )),
             nn.LayerNorm(proj_dim),
-            QuantumLayer(n_qubits, n_layers, proj_dim, proj_dim, use_quantum, False),
+            ProjectionTail(proj_dim, n_qubits, n_layers, projection_tail),
         )
+
+
+class ProjectionTail(nn.Module):
+    def __init__(self, proj_dim=768, n_qubits=10, n_layers=4, projection_tail="identity"):
+        super().__init__()
+        self.projection_tail = projection_tail
+        if projection_tail == "identity":
+            self.tail = nn.Identity()
+        elif projection_tail == "classical_bottleneck":
+            self.tail = nn.Sequential(
+                nn.Linear(proj_dim, n_qubits),
+                nn.GELU(),
+                nn.Linear(n_qubits, proj_dim),
+            )
+        elif projection_tail == "quantum":
+            self.tail = QuantumLayer(n_qubits, n_layers, proj_dim, proj_dim, True, False)
+        else:
+            raise ValueError(
+                "projection_tail must be one of: identity, quantum, classical_bottleneck"
+            )
+
+    def forward(self, x):
+        return self.tail(x)
