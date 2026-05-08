@@ -634,7 +634,10 @@ class VideoTextFeatureExtractor:
         if pixel_values.dim() == 4:
             pixel_values = pixel_values.unsqueeze(0)
         with torch.no_grad():
-            features = self.video_encoder_model.get_video_features(pixel_values=pixel_values)
+            features = self.video_encoder_model.get_video_features(
+                pixel_values=pixel_values,
+                return_dict=True,
+            )
         return F.normalize(features, dim=1)
 
     def _xclip_video_features(self, video_path):
