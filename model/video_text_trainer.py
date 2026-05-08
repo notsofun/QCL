@@ -152,6 +152,8 @@ class VideoTextTrainer(ContrastiveTrainerBase):
             text_pooling=getattr(self.args, "text_pooling", "truncate"),
             frame_sampling=getattr(self.args, "frame_sampling", "uniform"),
             video_chunk_stride=getattr(self.args, "video_chunk_stride", None),
+            text_preprocess=getattr(self.args, "text_preprocess", "none"),
+            text_first_n_words=getattr(self.args, "text_first_n_words", 40),
         )
 
     def _load_or_extract_features(self, extractor=None):
@@ -167,6 +169,8 @@ class VideoTextTrainer(ContrastiveTrainerBase):
             "feature_backend": "clip_frame" if self.args.feature_backend == "clip" else self.args.feature_backend,
             "video_pooling": self.args.video_pooling,
             "text_pooling": getattr(self.args, "text_pooling", "truncate"),
+            "text_preprocess": getattr(self.args, "text_preprocess", "none"),
+            "text_first_n_words": getattr(self.args, "text_first_n_words", 40),
             "frame_sampling": getattr(self.args, "frame_sampling", "uniform"),
             "video_chunk_stride": getattr(self.args, "video_chunk_stride", None),
         }
@@ -227,6 +231,7 @@ class VideoTextTrainer(ContrastiveTrainerBase):
         print("Feature backend:", self.args.feature_backend)
         print("Video pooling:", self.args.video_pooling)
         print("Text pooling:", getattr(self.args, "text_pooling", "truncate"))
+        print("Text preprocess:", getattr(self.args, "text_preprocess", "none"))
         print("Frame sampling:", getattr(self.args, "frame_sampling", "uniform"))
         print("Match pooling:", getattr(self.args, "match_pooling", "logmeanexp"))
         if self.args.feature_backend in {"clip", "clip_frame"}:
@@ -573,6 +578,8 @@ class VideoTextTrainer(ContrastiveTrainerBase):
             "num_frames": self.args.num_frames,
             "feature_backend": "clip_frame" if self.args.feature_backend == "clip" else self.args.feature_backend,
             "text_pooling": getattr(self.args, "text_pooling", "truncate"),
+            "text_preprocess": getattr(self.args, "text_preprocess", "none"),
+            "text_first_n_words": getattr(self.args, "text_first_n_words", 40),
             "frame_sampling": getattr(self.args, "frame_sampling", "uniform"),
             "video_chunk_stride": getattr(self.args, "video_chunk_stride", None),
             "match_pooling": getattr(self.args, "match_pooling", "logmeanexp"),
@@ -678,6 +685,8 @@ class VideoTextTrainer(ContrastiveTrainerBase):
             "num_frames": self.args.num_frames,
             "feature_backend": "clip_frame" if self.args.feature_backend == "clip" else self.args.feature_backend,
             "text_pooling": getattr(self.args, "text_pooling", "truncate"),
+            "text_preprocess": getattr(self.args, "text_preprocess", "none"),
+            "text_first_n_words": getattr(self.args, "text_first_n_words", 40),
             "frame_sampling": getattr(self.args, "frame_sampling", "uniform"),
             "video_chunk_stride": getattr(self.args, "video_chunk_stride", None),
             "match_pooling": getattr(self.args, "match_pooling", "logmeanexp"),

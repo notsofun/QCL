@@ -315,7 +315,8 @@ class VideoTextFeatureExtractor:
                  clip_batch_size=16, video_pooling="mean",
                  video_encoder_model_name="microsoft/xclip-base-patch32",
                  text_pooling="truncate", frame_sampling="uniform",
-                 video_chunk_stride=None):
+                 video_chunk_stride=None, text_preprocess="none",
+                 text_first_n_words=40):
         self.feature_dim = feature_dim
         self.num_frames = num_frames
         self.backend = "clip_frame" if backend == "clip" else backend
@@ -328,9 +329,13 @@ class VideoTextFeatureExtractor:
             raise ValueError(f"Unknown text_pooling: {text_pooling}")
         if frame_sampling not in {"uniform", "all"}:
             raise ValueError(f"Unknown frame_sampling: {frame_sampling}")
+        if text_preprocess not in {"none", "first_sentence", "first_n_words"}:
+            raise ValueError(f"Unknown text_preprocess: {text_preprocess}")
         self.text_pooling = text_pooling
         self.frame_sampling = frame_sampling
         self.video_chunk_stride = video_chunk_stride
+        self.text_preprocess = text_preprocess
+        self.text_first_n_words = text_first_n_words
         self.last_text_chunk_count = 1
         self.last_video_chunk_count = 1
         self.clip_model = None
@@ -426,10 +431,23 @@ class VideoTextFeatureExtractor:
             max_length = 77
         return int(max_length)
 
+    def _preprocess_text(self, text):
+        text = str(text).strip()
+        if self.text_preprocess == "none":
+            return text
+        if self.text_preprocess == "first_sentence":
+            pieces = re.split(r"(?<=[.!?。！？])\s+", text, maxsplit=1)
+            return pieces[0].strip() if pieces and pieces[0].strip() else text
+        if self.text_preprocess == "first_n_words":
+            words = re.findall(r"\S+", text)
+            return " ".join(words[:max(1, int(self.text_first_n_words))])
+        return text
+
     def _chunk_text_inputs(self, processor, text, max_length):
         tokenizer = processor.tokenizer
+        text = self._preprocess_text(text)
         token_ids = tokenizer(
-            str(text),
+            text,
             add_special_tokens=False,
             truncation=False,
             verbose=False,
@@ -460,8 +478,9 @@ class VideoTextFeatureExtractor:
             inputs, chunk_count = self._chunk_text_inputs(processor, text, max_length)
             self.last_text_chunk_count = chunk_count
         else:
+            text = self._preprocess_text(text)
             inputs = processor(
-                text=[str(text)],
+                text=[text],
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
@@ -506,7 +525,7 @@ class VideoTextFeatureExtractor:
                 allowed_keys={"input_ids", "attention_mask", "position_ids"},
             )
 
-        tokens = re.findall(r"[a-z0-9]+", str(text).lower())
+        tokens = re.findall(r"[a-z0-9]+", self._preprocess_text(text).lower())
         features = np.zeros(self.feature_dim, dtype=np.float32)
         for token in tokens:
             digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
@@ -747,6 +766,8 @@ class VideoTextFeatureExtractor:
             print(
                 "Text pooling:",
                 self.text_pooling,
+                "| text preprocess:",
+                self.text_preprocess,
                 "| chunks per caption min/median/mean/max:",
                 int(counts.min()),
                 float(np.median(counts)),

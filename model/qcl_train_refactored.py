@@ -136,6 +136,13 @@ def build_parser():
         help="text feature pooling: truncate keeps the model context limit, chunk_mean averages chunks, chunks keeps all caption chunks for pairwise matching",
     )
     parser.add_argument(
+        "--text_preprocess",
+        default="none",
+        choices=["none", "first_sentence", "first_n_words"],
+        help="optional text shortening before tokenization, useful for raw encoder sanity checks",
+    )
+    parser.add_argument("--text_first_n_words", default=40, type=int)
+    parser.add_argument(
         "--frame_sampling",
         default="uniform",
         choices=["uniform", "all"],
@@ -296,6 +303,8 @@ def train_video_text(args):
             "adapter",
             "video_pooling",
             "text_pooling",
+            "text_preprocess",
+            "text_first_n_words",
             "frame_sampling",
             "video_chunk_stride",
             "match_pooling",
