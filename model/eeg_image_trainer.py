@@ -31,21 +31,6 @@ except ImportError:
     from .muse_eeg_model import Enc_muse_eeg, Enc_nervformer_eeg
 
 
-class LegacyImageProjection(ProjectionHead):
-    def __init__(self, n_qubits=10, n_layers=4):
-        super().__init__(
-            embedding_dim=768,
-            proj_dim=768,
-            drop_proj=0.3,
-            n_qubits=n_qubits,
-            n_layers=n_layers,
-            projection_tail="quantum",
-        )
-
-    def forward(self, x):
-        return x
-
-
 class EegImageTrainer(ContrastiveTrainerBase):
     def __init__(self, args, subject):
         self.subject = subject
@@ -70,8 +55,8 @@ class EegImageTrainer(ContrastiveTrainerBase):
         self.train_logit_scale = bool(getattr(args, "train_logit_scale", False))
         self.structure_loss_weight = 0.0
         self.eeg_projection_tail = getattr(args, "eeg_projection_tail", "quantum")
-        self.image_projection_tail = getattr(args, "image_projection_tail", "legacy_identity")
         self.projection_tail = self.eeg_projection_tail
+        self.loss_direction = "source_to_target"
         self.batch_size_test = 400
         self.log_write = None
 
@@ -139,27 +124,9 @@ class EegImageTrainer(ContrastiveTrainerBase):
                 projection_tail=self.eeg_projection_tail,
             )
         )
-        if self.image_projection_tail == "legacy_identity":
-            self.image_projection = self._maybe_parallel(
-                LegacyImageProjection(
-                    n_qubits=self.args.n_qubits,
-                    n_layers=self.args.n_layers,
-                )
-            )
-        else:
-            self.image_projection = self._maybe_parallel(
-                ProjectionHead(
-                    embedding_dim=768,
-                    proj_dim=768,
-                    drop_proj=0.3,
-                    n_qubits=self.args.n_qubits,
-                    n_layers=self.args.n_layers,
-                    projection_tail=self.image_projection_tail,
-                )
-            )
         self.eeg_projection.apply(weights_init_normal)
-        self.image_projection.apply(weights_init_normal)
-        self.models = [self.eeg_encoder, self.eeg_projection, self.image_projection]
+        self.models = [self.eeg_encoder, self.eeg_projection]
+        self.trainable_modules = [self.eeg_encoder, self.eeg_projection]
 
         train_eeg, test_eeg, test_label = self._load_eeg_data()
         train_img_feature, _ = self._load_image_data()
@@ -213,11 +180,10 @@ class EegImageTrainer(ContrastiveTrainerBase):
     def encode_pair(self, eeg_batch, image_batch):
         eeg_features = self.eeg_encoder(eeg_batch)
         eeg_features = self.eeg_projection(eeg_features)
-        image_features = self.image_projection(image_batch)
-        return eeg_features, image_features
+        return eeg_features, image_batch
 
     def batch_extra_loss(self, eeg_batch, image_batch, source_embed, target_embed):
-        weight = float(getattr(self.args, "eeg_raw_structure_loss_weight", 1.0))
+        weight = float(getattr(self.args, "eeg_raw_structure_loss_weight", 0.0))
         if weight <= 0:
             return source_embed.new_tensor(0.0)
         flattened_eeg = eeg_batch.view(eeg_batch.shape[0], -1)
@@ -231,10 +197,6 @@ class EegImageTrainer(ContrastiveTrainerBase):
         torch.save(
             model_state_dict(self.eeg_projection),
             os.path.join(self.model_path, self.model_idx + "Proj_eeg_cls.pth"),
-        )
-        torch.save(
-            model_state_dict(self.image_projection),
-            os.path.join(self.model_path, self.model_idx + "Proj_img_cls.pth"),
         )
 
     def on_epoch_end(self, epoch, train_metrics, val_metrics, max_quantum_grad_norm):
@@ -261,11 +223,6 @@ class EegImageTrainer(ContrastiveTrainerBase):
             os.path.join(self.model_path, self.model_idx + "Proj_eeg_cls.pth"),
             self.device,
         )
-        load_model_state(
-            self.image_projection,
-            os.path.join(self.model_path, self.model_idx + "Proj_img_cls.pth"),
-            self.device,
-        )
 
     def after_training(self):
         self._load_best_checkpoint()
@@ -277,8 +234,7 @@ class EegImageTrainer(ContrastiveTrainerBase):
         all_center = self.test_center.to(self.device)
 
         with torch.no_grad():
-            if self.image_projection_tail != "legacy_identity":
-                all_center = normalize_features(self.image_projection(all_center))
+            all_center = normalize_features(all_center)
             for eeg, label in self._test_loader:
                 eeg = eeg.to(self.device)
                 label = label.to(self.device)

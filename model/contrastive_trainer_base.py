@@ -53,6 +53,9 @@ def get_device(device_name="auto"):
 def resolve_projection_tail(args):
     if getattr(args, "projection_tail", None) is not None:
         return args.projection_tail
+    adapter = getattr(args, "adapter", None)
+    if adapter in {"raw", "quantum"}:
+        return adapter
     return "quantum" if getattr(args, "use_quantum", True) else "identity"
 
 
@@ -143,7 +146,7 @@ class ProjectionTail(nn.Module):
     def __init__(self, proj_dim=768, n_qubits=10, n_layers=4, projection_tail="identity"):
         super().__init__()
         self.projection_tail = projection_tail
-        if projection_tail == "identity":
+        if projection_tail in {"identity", "raw"}:
             self.tail = nn.Identity()
         elif projection_tail == "classical_bottleneck":
             self.tail = nn.Sequential(
@@ -154,7 +157,7 @@ class ProjectionTail(nn.Module):
         elif projection_tail == "quantum":
             self.tail = QuantumLayer(n_qubits, n_layers, proj_dim, proj_dim)
         else:
-            raise ValueError("projection_tail must be one of: identity, quantum, classical_bottleneck")
+            raise ValueError("projection_tail must be one of: raw, identity, quantum, classical_bottleneck")
 
     def forward(self, x):
         return self.tail(x)
@@ -189,6 +192,21 @@ class IdentityProjection(nn.Module):
         return x
 
 
+def set_requires_grad(module, requires_grad):
+    for param in module.parameters():
+        param.requires_grad_(requires_grad)
+
+
+def freeze_module(module):
+    set_requires_grad(module, False)
+    module.eval()
+
+
+def unfreeze_module(module):
+    set_requires_grad(module, True)
+    module.train()
+
+
 class ContrastiveTrainerBase(ABC):
     def __init__(self, args, task_name, result_path, model_path, device=None):
         self.args = args
@@ -202,8 +220,11 @@ class ContrastiveTrainerBase(ABC):
         self.best_epoch = 0
         self.grad_accum_steps = max(1, int(getattr(args, "grad_accum_steps", 1)))
         self.structure_loss_weight = float(getattr(args, "structure_loss_weight", 0.0))
-        self.train_logit_scale = True
+        self.train_logit_scale = bool(getattr(args, "train_logit_scale", False))
+        self.loss_direction = getattr(args, "loss_direction", "source_to_target")
         self.models = []
+        self.trainable_modules = []
+        self.frozen_modules = []
         os.makedirs(self.result_path, exist_ok=True)
         os.makedirs(self.model_path, exist_ok=True)
 
@@ -233,8 +254,9 @@ class ContrastiveTrainerBase(ABC):
 
     def trainable_parameters(self):
         params = []
-        for model in self.models:
-            params.extend(list(model.parameters()))
+        modules = self.trainable_modules if self.trainable_modules else self.models
+        for model in modules:
+            params.extend([param for param in model.parameters() if param.requires_grad])
         if self.train_logit_scale:
             params.append(self.logit_scale)
         return params
@@ -243,11 +265,18 @@ class ContrastiveTrainerBase(ABC):
         return source_embed.new_tensor(0.0)
 
     def set_train_mode(self):
-        for model in self.models:
+        for model in self.frozen_modules:
+            model.eval()
+        modules = self.trainable_modules if self.trainable_modules else self.models
+        for model in modules:
             model.train()
 
     def set_eval_mode(self):
         for model in self.models:
+            model.eval()
+        for model in self.trainable_modules:
+            model.eval()
+        for model in self.frozen_modules:
             model.eval()
 
     def to_device_batch(self, batch):
@@ -260,11 +289,18 @@ class ContrastiveTrainerBase(ABC):
         target_embed = normalize_features(target_embed)
 
         logits_per_source = self.logit_scale.exp() * source_embed @ target_embed.t()
-        logits_per_target = logits_per_source.t()
         loss_source = self.criterion_cls(logits_per_source, labels)
-        loss_target = self.criterion_cls(logits_per_target, labels)
-        contrastive_loss = (loss_source + loss_target) / 2
-        structure_loss = compute_structure_loss(source_embed, target_embed)
+        if self.loss_direction == "symmetric":
+            logits_per_target = logits_per_source.t()
+            loss_target = self.criterion_cls(logits_per_target, labels)
+            contrastive_loss = (loss_source + loss_target) / 2
+        else:
+            loss_target = source_embed.new_tensor(0.0)
+            contrastive_loss = loss_source
+        if self.structure_loss_weight > 0:
+            structure_loss = compute_structure_loss(source_embed, target_embed)
+        else:
+            structure_loss = source_embed.new_tensor(0.0)
         extra_loss = self.batch_extra_loss(source_batch, target_batch, source_embed, target_embed) if include_extra else source_embed.new_tensor(0.0)
         total_loss = contrastive_loss + self.structure_loss_weight * structure_loss + extra_loss
         return {
@@ -308,13 +344,17 @@ class ContrastiveTrainerBase(ABC):
 
     def train(self):
         self.prepare()
+        trainable_params = self.trainable_parameters()
+        if not trainable_params:
+            return self.after_training()
         optimizer = torch.optim.AdamW(
-            self.trainable_parameters(),
+            trainable_params,
             lr=float(getattr(self.args, "lr", 0.0002)),
             betas=(0.5, 0.999),
         )
         projection_tail = getattr(self, "projection_tail", None)
-        quantum_param_count = sum(quantum_parameter_stats(model)[0] for model in self.models)
+        quantum_modules = self.trainable_modules if self.trainable_modules else self.models
+        quantum_param_count = sum(quantum_parameter_stats(model)[0] for model in quantum_modules)
         if projection_tail == "quantum" and quantum_param_count == 0:
             raise RuntimeError("projection_tail=quantum was requested, but no qlayer parameters were found.")
 
@@ -339,7 +379,7 @@ class ContrastiveTrainerBase(ABC):
                 source_batch, target_batch = self.to_device_batch([source_batch, target_batch])
                 losses = self.compute_pair_losses(source_batch, target_batch, include_extra=True)
                 (losses["total"] / self.grad_accum_steps).backward()
-                for model in self.models:
+                for model in quantum_modules:
                     _, quantum_grad_norm = quantum_parameter_stats(model)
                     max_quantum_grad_norm = max(max_quantum_grad_norm, quantum_grad_norm)
                 accum_counter += 1

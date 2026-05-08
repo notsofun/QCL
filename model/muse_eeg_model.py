@@ -313,7 +313,9 @@ class VideoTextFeatureExtractor:
     def __init__(self, feature_dim=768, num_frames=8, backend="clip",
                  clip_model_name="openai/clip-vit-base-patch32", device="cpu",
                  clip_batch_size=16, video_pooling="mean",
-                 video_encoder_model_name="microsoft/xclip-base-patch32"):
+                 video_encoder_model_name="microsoft/xclip-base-patch32",
+                 text_pooling="truncate", frame_sampling="uniform",
+                 video_chunk_stride=None):
         self.feature_dim = feature_dim
         self.num_frames = num_frames
         self.backend = "clip_frame" if backend == "clip" else backend
@@ -322,10 +324,20 @@ class VideoTextFeatureExtractor:
         self.device = torch.device(device)
         self.clip_batch_size = clip_batch_size
         self.video_pooling = video_pooling
+        if text_pooling not in {"truncate", "chunk_mean", "chunks"}:
+            raise ValueError(f"Unknown text_pooling: {text_pooling}")
+        if frame_sampling not in {"uniform", "all"}:
+            raise ValueError(f"Unknown frame_sampling: {frame_sampling}")
+        self.text_pooling = text_pooling
+        self.frame_sampling = frame_sampling
+        self.video_chunk_stride = video_chunk_stride
+        self.last_text_chunk_count = 1
+        self.last_video_chunk_count = 1
         self.clip_model = None
         self.clip_processor = None
         self.video_encoder_model = None
         self.video_encoder_processor = None
+        self.video_encoder_num_frames = None
         if self.backend == "clip_frame":
             self._load_clip()
         if self.backend == "video_encoder":
@@ -358,36 +370,114 @@ class VideoTextFeatureExtractor:
         self.video_encoder_model = XCLIPModel.from_pretrained(self.video_encoder_model_name).to(self.device)
         self.video_encoder_model.eval()
         self.video_encoder_processor = XCLIPProcessor.from_pretrained(self.video_encoder_model_name)
+        self.video_encoder_num_frames = int(
+            getattr(self.video_encoder_model.config.vision_config, "num_frames", 8)
+        )
+        if self.frame_sampling == "all":
+            print(
+                "Video encoder frame window:",
+                self.video_encoder_num_frames,
+                "| frame sampling: all",
+                "| using chunked video encoding",
+            )
+        elif self.num_frames != self.video_encoder_num_frames:
+            print(
+                "Video encoder frame window:",
+                self.video_encoder_num_frames,
+                "| sampled frames:",
+                self.num_frames,
+                "| using chunked video encoding",
+            )
+
+    @staticmethod
+    def _text_max_length(model, processor):
+        text_config = getattr(getattr(model, "config", None), "text_config", None)
+        max_length = getattr(text_config, "max_position_embeddings", None)
+        if max_length is None:
+            max_length = getattr(processor.tokenizer, "model_max_length", 77)
+        if max_length is None or max_length > 10000:
+            max_length = 77
+        return int(max_length)
+
+    def _chunk_text_inputs(self, processor, text, max_length):
+        tokenizer = processor.tokenizer
+        token_ids = tokenizer(
+            str(text),
+            add_special_tokens=False,
+            truncation=False,
+            verbose=False,
+        )["input_ids"]
+        if token_ids and isinstance(token_ids[0], list):
+            token_ids = token_ids[0]
+        special_count = tokenizer.num_special_tokens_to_add(pair=False)
+        chunk_size = max(1, max_length - special_count)
+        chunks = [
+            token_ids[start:start + chunk_size]
+            for start in range(0, len(token_ids), chunk_size)
+        ] or [[]]
+
+        encoded_chunks = []
+        for chunk in chunks:
+            input_ids = tokenizer.build_inputs_with_special_tokens(chunk)
+            if len(input_ids) > max_length:
+                input_ids = input_ids[:max_length]
+            encoded_chunks.append({
+                "input_ids": input_ids,
+                "attention_mask": [1] * len(input_ids),
+            })
+        return tokenizer.pad(encoded_chunks, padding=True, return_tensors="pt"), len(chunks)
+
+    def _encode_text_features(self, text, processor, get_text_features, max_length,
+                              allowed_keys=None):
+        if self.text_pooling in {"chunk_mean", "chunks"}:
+            inputs, chunk_count = self._chunk_text_inputs(processor, text, max_length)
+            self.last_text_chunk_count = chunk_count
+        else:
+            inputs = processor(
+                text=[str(text)],
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            )
+            self.last_text_chunk_count = 1
+
+        feature_batches = []
+        num_chunks = inputs["input_ids"].shape[0]
+        for start in range(0, num_chunks, self.clip_batch_size):
+            batch = {
+                key: value[start:start + self.clip_batch_size].to(self.device)
+                for key, value in inputs.items()
+                if allowed_keys is None or key in allowed_keys
+            }
+            with torch.no_grad():
+                features = get_text_features(**batch)
+            feature_batches.append(F.normalize(features, dim=1))
+
+        features = torch.cat(feature_batches, dim=0)
+        features = F.normalize(features, dim=1)
+        if self.text_pooling == "chunks":
+            return features.detach().cpu().numpy().astype(np.float32)
+
+        features = features.mean(dim=0, keepdim=True)
+        features = F.normalize(features, dim=1)
+        return features.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
     def text_features(self, text):
         if self.backend == "clip_frame":
-            inputs = self.clip_processor(
-                text=[str(text)],
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
+            return self._encode_text_features(
+                text,
+                self.clip_processor,
+                self.clip_model.get_text_features,
+                self._text_max_length(self.clip_model, self.clip_processor),
             )
-            inputs = {key: value.to(self.device) for key, value in inputs.items()}
-            with torch.no_grad():
-                features = self.clip_model.get_text_features(**inputs)
-            features = F.normalize(features, dim=1)
-            return features.squeeze(0).detach().cpu().numpy().astype(np.float32)
         if self.backend == "video_encoder":
-            inputs = self.video_encoder_processor(
-                text=[str(text)],
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
+            return self._encode_text_features(
+                text,
+                self.video_encoder_processor,
+                self.video_encoder_model.get_text_features,
+                self._text_max_length(self.video_encoder_model, self.video_encoder_processor),
+                allowed_keys={"input_ids", "attention_mask", "position_ids"},
             )
-            text_inputs = {
-                key: value.to(self.device)
-                for key, value in inputs.items()
-                if key in {"input_ids", "attention_mask", "position_ids"}
-            }
-            with torch.no_grad():
-                features = self.video_encoder_model.get_text_features(**text_inputs)
-            features = F.normalize(features, dim=1)
-            return features.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
         tokens = re.findall(r"[a-z0-9]+", str(text).lower())
         features = np.zeros(self.feature_dim, dtype=np.float32)
@@ -422,6 +512,18 @@ class VideoTextFeatureExtractor:
             raise ValueError(f"OpenCV cannot open video: {video_path}")
 
         frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        if self.frame_sampling == "all":
+            frames = []
+            while True:
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    break
+                frames.append(frame)
+            capture.release()
+            if not frames:
+                raise ValueError(f"OpenCV opened but decoded no frames: {video_path}")
+            return frames
+
         if frame_count <= 0:
             frame_indices = list(range(self.num_frames))
         else:
@@ -460,6 +562,7 @@ class VideoTextFeatureExtractor:
 
     def _clip_video_features(self, video_path):
         frame_features = self._clip_frame_features(video_path)
+        self.last_video_chunk_count = frame_features.shape[0]
         if self.video_pooling == "mean":
             features = frame_features.mean(dim=0, keepdim=True)
             features = F.normalize(features, dim=1)
@@ -468,16 +571,26 @@ class VideoTextFeatureExtractor:
             mean = frame_features.mean(dim=0)
             std = frame_features.std(dim=0, unbiased=False)
             return torch.cat([mean, std], dim=0).numpy().astype(np.float32)
-        if self.video_pooling in {"temporal_mlp", "attention", "temporal_attention"}:
+        if self.video_pooling in {"temporal_mlp", "attention", "temporal_attention", "chunks"}:
             return frame_features.numpy().astype(np.float32)
         raise ValueError(f"Unknown video_pooling: {self.video_pooling}")
 
-    def _xclip_video_features(self, video_path):
-        frames = self._sample_video_frames(video_path)
-        rgb_frames = [
-            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            for frame in frames
-        ]
+    @staticmethod
+    def _chunk_frames(frames, chunk_size, stride=None):
+        stride = stride or chunk_size
+        if stride <= 0:
+            raise ValueError("video_chunk_stride must be positive")
+        chunks = []
+        for start in range(0, len(frames), stride):
+            chunk = list(frames[start:start + chunk_size])
+            if len(chunk) < chunk_size:
+                chunk.extend([chunk[-1]] * (chunk_size - len(chunk)))
+            chunks.append(chunk)
+            if start + chunk_size >= len(frames):
+                break
+        return chunks
+
+    def _xclip_chunk_features(self, rgb_frames):
         try:
             inputs = self.video_encoder_processor(videos=[rgb_frames], return_tensors="pt")
         except Exception:
@@ -488,6 +601,25 @@ class VideoTextFeatureExtractor:
             pixel_values = pixel_values.unsqueeze(0)
         with torch.no_grad():
             features = self.video_encoder_model.get_video_features(pixel_values=pixel_values)
+        return F.normalize(features, dim=1)
+
+    def _xclip_video_features(self, video_path):
+        frames = self._sample_video_frames(video_path)
+        rgb_frames = [
+            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            for frame in frames
+        ]
+        chunk_size = self.video_encoder_num_frames or len(rgb_frames)
+        stride = self.video_chunk_stride or chunk_size
+        chunk_features = [
+            self._xclip_chunk_features(chunk)
+            for chunk in self._chunk_frames(rgb_frames, chunk_size, stride)
+        ]
+        features = torch.cat(chunk_features, dim=0)
+        self.last_video_chunk_count = features.shape[0]
+        if self.video_pooling == "chunks":
+            return features.detach().cpu().numpy().astype(np.float32)
+        features = features.mean(dim=0, keepdim=True)
         features = F.normalize(features, dim=1)
         return features.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
@@ -514,7 +646,60 @@ class VideoTextFeatureExtractor:
             np.std(motion) if motion else 0.0,
         ], dtype=np.float32)
         features = np.concatenate([stats.mean(axis=0), stats.std(axis=0), motion_features])
+        self.last_video_chunk_count = 1
         return _l2_normalize(_pad_or_trim(features, self.feature_dim))
+
+    @staticmethod
+    def _stack_feature_arrays(feature_arrays, label):
+        arrays = [np.asarray(array, dtype=np.float32) for array in feature_arrays]
+        if all(array.ndim == 1 for array in arrays):
+            return torch.tensor(np.stack(arrays), dtype=torch.float32)
+
+        arrays = [
+            array.reshape(1, -1) if array.ndim == 1 else array
+            for array in arrays
+        ]
+        if not all(array.ndim == 2 for array in arrays):
+            ranks = sorted({array.ndim for array in arrays})
+            raise ValueError(f"{label} features must be 1D or 2D arrays, got ranks {ranks}")
+
+        feature_dim = arrays[0].shape[1]
+        if any(array.shape[1] != feature_dim for array in arrays):
+            dims = sorted({array.shape[1] for array in arrays})
+            raise ValueError(f"{label} feature dimensions do not match: {dims}")
+
+        max_chunks = max(array.shape[0] for array in arrays)
+        padded = np.zeros((len(arrays), max_chunks, feature_dim), dtype=np.float32)
+        for index, array in enumerate(arrays):
+            padded[index, :array.shape[0]] = array
+        return torch.tensor(padded, dtype=torch.float32)
+
+    def _text_features_from_dataframe(self, data):
+        text_features = []
+        chunk_counts = []
+        for _, row in data.iterrows():
+            text_features.append(self.text_features(row["text"]))
+            chunk_counts.append(self.last_text_chunk_count)
+
+        if chunk_counts:
+            counts = np.asarray(chunk_counts, dtype=np.float32)
+            print(
+                "Text pooling:",
+                self.text_pooling,
+                "| chunks per caption min/median/mean/max:",
+                int(counts.min()),
+                float(np.median(counts)),
+                float(counts.mean()),
+                int(counts.max()),
+            )
+        return self._stack_feature_arrays(text_features, "text")
+
+    def load_text_features(self, manifest_path):
+        manifest_path = Path(manifest_path).resolve()
+        data = pd.read_csv(manifest_path)
+        if "text" not in data.columns:
+            raise ValueError("Manifest is missing column: text")
+        return self._text_features_from_dataframe(data)
 
     def load_manifest(self, manifest_path):
         manifest_path = Path(manifest_path).resolve()
@@ -525,19 +710,33 @@ class VideoTextFeatureExtractor:
             raise ValueError(f"Manifest is missing columns: {sorted(missing)}")
 
         video_features = []
-        text_features = []
+        video_chunk_counts = []
         decoded_paths = []
         for _, row in data.iterrows():
             video_path = Path(str(row["video_path"]))
             if not video_path.is_absolute():
                 video_path = manifest_path.parent / video_path
             video_features.append(self.video_features(video_path))
-            text_features.append(self.text_features(row["text"]))
+            video_chunk_counts.append(self.last_video_chunk_count)
             decoded_paths.append(str(video_path))
+        text_features = self._text_features_from_dataframe(data)
+        if video_chunk_counts:
+            counts = np.asarray(video_chunk_counts, dtype=np.float32)
+            print(
+                "Video pooling:",
+                self.video_pooling,
+                "| frame sampling:",
+                self.frame_sampling,
+                "| chunks per video min/median/mean/max:",
+                int(counts.min()),
+                float(np.median(counts)),
+                float(counts.mean()),
+                int(counts.max()),
+            )
 
         return (
-            torch.tensor(np.stack(video_features), dtype=torch.float32),
-            torch.tensor(np.stack(text_features), dtype=torch.float32),
+            self._stack_feature_arrays(video_features, "video"),
+            text_features,
             decoded_paths,
         )
 

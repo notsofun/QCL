@@ -1,0 +1,31 @@
+name: qcl
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip>=24.0
+  - pytorch>=2.2,<2.5
+  - torchvision>=0.17,<0.20
+  - torchaudio>=2.2,<2.5
+  - pytorch-cuda=12.1
+  - numpy>=1.24,<2.0
+  - pandas>=2.0,<3.0
+  - scipy>=1.10,<2.0
+  - scikit-learn>=1.3,<2.0
+  - matplotlib>=3.7,<4.0
+  - pillow>=10.0,<11.0
+  - tqdm>=4.66,<5.0
+  - pip:
+      - torch-geometric>=2.5,<3.0
+      - pennylane>=0.35,<0.40
+      - transformers>=4.41,<5.0
+      - accelerate>=0.30,<1.0
+      - open-clip-torch>=2.24,<3.0
+      - opencv-python-headless>=4.8,<5.0
+      - mne>=1.6,<2.0
+      - datasets>=2.19,<3.0
+      - huggingface-hub>=0.23,<1.0
+      - einops>=0.7,<1.0
