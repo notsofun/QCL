@@ -368,6 +368,7 @@ class VideoTextFeatureExtractor:
             ) from exc
 
         self.video_encoder_model = XCLIPModel.from_pretrained(self.video_encoder_model_name).to(self.device)
+        self._force_return_dict(self.video_encoder_model)
         self.video_encoder_model.eval()
         self.video_encoder_processor = XCLIPProcessor.from_pretrained(self.video_encoder_model_name)
         self.video_encoder_num_frames = int(
@@ -388,6 +389,32 @@ class VideoTextFeatureExtractor:
                 self.num_frames,
                 "| using chunked video encoding",
             )
+
+    @staticmethod
+    def _force_return_dict(module):
+        config = getattr(module, "config", None)
+        if config is not None:
+            try:
+                config.return_dict = True
+            except Exception:
+                pass
+            try:
+                config.use_return_dict = True
+            except Exception:
+                pass
+        for child_name in ("vision_model", "mit", "text_model"):
+            child = getattr(module, child_name, None)
+            child_config = getattr(child, "config", None)
+            if child_config is None:
+                continue
+            try:
+                child_config.return_dict = True
+            except Exception:
+                pass
+            try:
+                child_config.use_return_dict = True
+            except Exception:
+                pass
 
     @staticmethod
     def _text_max_length(model, processor):
@@ -634,10 +661,7 @@ class VideoTextFeatureExtractor:
         if pixel_values.dim() == 4:
             pixel_values = pixel_values.unsqueeze(0)
         with torch.no_grad():
-            features = self.video_encoder_model.get_video_features(
-                pixel_values=pixel_values,
-                return_dict=True,
-            )
+            features = self.video_encoder_model.get_video_features(pixel_values=pixel_values)
         return F.normalize(features, dim=1)
 
     def _xclip_video_features(self, video_path):
