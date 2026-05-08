@@ -3,7 +3,7 @@ set -euo pipefail
 
 ENV_NAME="${ENV_NAME:-qcl}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
-CUDA_VERSION="${CUDA_VERSION:-cu121}"
+CUDA_VERSION="${CUDA_VERSION:-cu128}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -37,9 +37,9 @@ fi
 
 echo "[3/5] Installing PyTorch for ${CUDA_VERSION}"
 if [ "${CUDA_VERSION}" = "cpu" ]; then
-  python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2,<2.5" "torchvision>=0.17,<0.20" "torchaudio>=2.2,<2.5"
+  python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.7,<3.0" "torchvision>=0.22,<1.0" "torchaudio>=2.7,<3.0"
 else
-  python -m pip install --index-url "https://download.pytorch.org/whl/${CUDA_VERSION}" "torch>=2.2,<2.5" "torchvision>=0.17,<0.20" "torchaudio>=2.2,<2.5"
+  python -m pip install --index-url "https://download.pytorch.org/whl/${CUDA_VERSION}" "torch>=2.7,<3.0" "torchvision>=0.22,<1.0" "torchaudio>=2.7,<3.0"
 fi
 
 echo "[4/5] Installing project dependencies"

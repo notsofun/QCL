@@ -7,14 +7,15 @@ matplotlib>=3.7,<4.0
 tqdm>=4.66,<5.0
 
 # Deep learning
-torch>=2.2,<2.5
-torchvision>=0.17,<0.20
-torchaudio>=2.2,<2.5
+torch>=2.7,<3.0
+torchvision>=0.22,<1.0
+torchaudio>=2.7,<3.0
 torch-geometric>=2.5,<3.0
 einops>=0.7,<1.0
 
 # Quantum machine learning
 pennylane>=0.35,<0.40
+autoray>=0.6.7,<0.8
 
 # Vision/video/text feature extraction
 transformers>=4.41,<5.0

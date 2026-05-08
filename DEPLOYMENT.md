@@ -6,7 +6,7 @@ This project is a Python/PyTorch research codebase for EEG-image and video-text 
 
 - Ubuntu 20.04/22.04
 - Python 3.10
-- NVIDIA driver compatible with CUDA 12.1 for GPU training
+- NVIDIA driver compatible with CUDA 12.8 for GPU training
 - At least 16 GB RAM; GPU memory depends on batch size and feature backend
 
 ## One-Command Setup
@@ -27,6 +27,9 @@ CUDA_VERSION=cpu bash scripts/setup_cloud.sh
 
 # Custom environment name
 ENV_NAME=qcl-prod bash scripts/setup_cloud.sh
+
+# Older GPU/server image, if CUDA 12.8 is unavailable
+CUDA_VERSION=cu126 bash scripts/setup_cloud.sh
 ```
 
 ## Conda Alternative

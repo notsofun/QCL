@@ -591,12 +591,46 @@ class VideoTextFeatureExtractor:
         return chunks
 
     def _xclip_chunk_features(self, rgb_frames):
-        try:
-            inputs = self.video_encoder_processor(videos=[rgb_frames], return_tensors="pt")
-        except Exception:
-            inputs = self.video_encoder_processor(videos=rgb_frames, return_tensors="pt")
-        inputs = {key: value.to(self.device) for key, value in inputs.items()}
-        pixel_values = inputs["pixel_values"]
+        processor_attempts = [
+            lambda: self.video_encoder_processor(videos=[rgb_frames], return_tensors="pt"),
+            lambda: self.video_encoder_processor(videos=rgb_frames, return_tensors="pt"),
+        ]
+        image_processor = getattr(self.video_encoder_processor, "image_processor", None)
+        if image_processor is not None:
+            processor_attempts.append(lambda: image_processor(rgb_frames, return_tensors="pt"))
+
+        inputs = None
+        errors = []
+        for attempt in processor_attempts:
+            try:
+                candidate = attempt()
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            if any(key in candidate for key in ("pixel_values", "pixel_values_videos", "video_pixel_values")):
+                inputs = candidate
+                break
+            inputs = candidate
+
+        if inputs is None:
+            raise RuntimeError(
+                "XCLIP processor could not encode video frames. "
+                f"Processor errors: {errors[-3:]}"
+            )
+
+        pixel_values = None
+        for key in ("pixel_values", "pixel_values_videos", "video_pixel_values"):
+            if key in inputs:
+                pixel_values = inputs[key]
+                break
+        if pixel_values is None:
+            raise KeyError(
+                "XCLIP processor output does not contain video pixel values. "
+                f"Available keys: {list(inputs.keys())}. "
+                "Try upgrading transformers or use --feature_backend clip_frame."
+            )
+
+        pixel_values = pixel_values.to(self.device)
         if pixel_values.dim() == 4:
             pixel_values = pixel_values.unsqueeze(0)
         with torch.no_grad():
@@ -701,6 +735,20 @@ class VideoTextFeatureExtractor:
             raise ValueError("Manifest is missing column: text")
         return self._text_features_from_dataframe(data)
 
+    @staticmethod
+    def _resolve_manifest_video_path(manifest_path, raw_video_path):
+        raw_path = str(raw_video_path).strip()
+        if not raw_path:
+            raise ValueError("Manifest contains an empty video_path value")
+
+        # Manifests may be generated on Windows and then copied to Linux cloud
+        # machines. Normalize separators before Path interprets the string.
+        normalized_path = raw_path.replace("\\", "/")
+        video_path = Path(normalized_path)
+        if not video_path.is_absolute():
+            video_path = manifest_path.parent / video_path
+        return video_path
+
     def load_manifest(self, manifest_path):
         manifest_path = Path(manifest_path).resolve()
         data = pd.read_csv(manifest_path)
@@ -713,9 +761,12 @@ class VideoTextFeatureExtractor:
         video_chunk_counts = []
         decoded_paths = []
         for _, row in data.iterrows():
-            video_path = Path(str(row["video_path"]))
-            if not video_path.is_absolute():
-                video_path = manifest_path.parent / video_path
+            video_path = self._resolve_manifest_video_path(manifest_path, row["video_path"])
+            if not video_path.exists():
+                raise FileNotFoundError(
+                    "Manifest video file does not exist after path normalization: "
+                    f"{video_path} (raw value: {row['video_path']})"
+                )
             video_features.append(self.video_features(video_path))
             video_chunk_counts.append(self.last_video_chunk_count)
             decoded_paths.append(str(video_path))

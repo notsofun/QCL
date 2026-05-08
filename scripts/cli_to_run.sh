@@ -1,18 +1,18 @@
-python model\qcl_train_refactored.py `
-  --task video_text `
-  --manifest Data\llava-video-0-30-academic\manifest.csv `
-  --feature_backend video_encoder `
-  --adapter compare `
-  --frame_sampling all `
-  --video_pooling chunks `
-  --text_pooling chunks `
-  --video_chunk_stride 8 `
-  --match_pooling logmeanexp `
-  --match_temperature 0.07 `
-  --epoch 30 `
-  --batch-size 1000 `
-  --lr 0.01 `
-  --cache_features true `
-  --result_path results\qcl_video_text_xclip_allframes_chunks_raw_vs_quantum `
-  --model_path results\qcl_video_text_xclip_allframes_chunks_raw_vs_quantum_models `
+python model/qcl_train_refactored.py \
+  --task video_text \
+  --manifest Data/llava-video-0-30-academic/manifest.csv \
+  --feature_backend video_encoder \
+  --adapter compare \
+  --frame_sampling all \
+  --video_pooling chunks \
+  --text_pooling chunks \
+  --video_chunk_stride 8 \
+  --match_pooling logmeanexp \
+  --match_temperature 0.07 \
+  --epoch 30 \
+  --batch-size 1000 \
+  --lr 0.01 \
+  --cache_features true \
+  --result_path results/qcl_video_text_xclip_allframes_chunks_raw_vs_quantum \
+  --model_path results/qcl_video_text_xclip_allframes_chunks_raw_vs_quantum_models \
   --device auto
