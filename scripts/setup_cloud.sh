@@ -10,8 +10,13 @@ cd "$repo_root"
 
 echo "[1/5] Installing system packages"
 if command -v apt-get >/dev/null 2>&1; then
-  sudo apt-get update
-  sudo apt-get install -y git curl wget ffmpeg libgl1 libglib2.0-0
+  if command -v sudo >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y git curl wget ffmpeg libgl1 libglib2.0-0
+  else
+    apt-get update
+    apt-get install -y git curl wget ffmpeg libgl1 libglib2.0-0
+  fi
 else
   echo "apt-get not found; skipping system package installation."
 fi
