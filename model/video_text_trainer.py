@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 
 import numpy as np
@@ -241,6 +242,10 @@ class VideoTextTrainer(ContrastiveTrainerBase):
         print("Manifest:", os.path.abspath(self.args.manifest))
 
         self.video_features, self.text_features, decoded_paths = self._load_or_extract_features()
+        self.decoded_paths = list(decoded_paths)
+        manifest_data = pd.read_csv(self.args.manifest)
+        self.manifest_texts = manifest_data["text"].astype(str).tolist()
+        self.manifest_video_paths = manifest_data["video_path"].astype(str).tolist()
         print("Decoded video files:", len(decoded_paths))
         print("Feature shapes video/text:", tuple(self.video_features.shape), tuple(self.text_features.shape))
         if self.video_features.dim() not in {2, 3}:
@@ -464,6 +469,189 @@ class VideoTextTrainer(ContrastiveTrainerBase):
             logits_v2t = 100.0 * self._pairwise_similarity(video_embed, text_embed)
             logits_t2v = logits_v2t.t()
             return retrieval_scores(logits_v2t, labels), retrieval_scores(logits_t2v, labels)
+
+    def _pairwise_chunk_argmax(self, video_embed, text_embed):
+        video_raw = self._as_sequence(video_embed)
+        text_raw = self._as_sequence(text_embed)
+        video_mask = self._sequence_mask(video_raw)
+        text_mask = self._sequence_mask(text_raw)
+        video_seq = self._normalize_sequence(video_raw)
+        text_seq = self._normalize_sequence(text_raw)
+
+        similarities = torch.einsum("bvd,ntd->bnvt", video_seq, text_seq)
+        pair_mask = video_mask[:, None, :, None] & text_mask[None, :, None, :]
+        masked = similarities.masked_fill(~pair_mask, -1e9)
+        flat = masked.flatten(start_dim=2)
+        best_scores, best_flat = flat.max(dim=-1)
+        text_chunk_count = text_seq.shape[1]
+        best_video_chunks = best_flat // text_chunk_count
+        best_text_chunks = best_flat % text_chunk_count
+        no_valid_pair = pair_mask.flatten(start_dim=2).sum(dim=-1) == 0
+        best_video_chunks = best_video_chunks.masked_fill(no_valid_pair, -1)
+        best_text_chunks = best_text_chunks.masked_fill(no_valid_pair, -1)
+        best_scores = best_scores.masked_fill(no_valid_pair, float("nan"))
+        return best_video_chunks, best_text_chunks, best_scores
+
+    def _retrieval_logits_and_chunk_details(self, indices, use_raw=False):
+        self.set_eval_mode()
+        with torch.no_grad():
+            video_batch = self.video_features[indices].to(self.device)
+            text_batch = self.text_features[indices].to(self.device)
+            video_embed = self.encode_video(video_batch, use_raw=use_raw)
+            text_embed = align_last_feature_dim(text_batch, self.text_dim)
+            logits = 100.0 * self._pairwise_similarity(video_embed, text_embed)
+            best_video_chunks, best_text_chunks, best_chunk_scores = self._pairwise_chunk_argmax(
+                video_embed,
+                text_embed,
+            )
+        return (
+            logits.detach().cpu(),
+            best_video_chunks.detach().cpu(),
+            best_text_chunks.detach().cpu(),
+            best_chunk_scores.detach().cpu(),
+        )
+
+    @staticmethod
+    def _csv_text(value, max_chars=1200):
+        text = " ".join(str(value).split())
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "..."
+
+    def _item_text(self, global_idx):
+        global_idx = int(global_idx)
+        if hasattr(self, "manifest_texts") and 0 <= global_idx < len(self.manifest_texts):
+            return self._csv_text(self.manifest_texts[global_idx])
+        return ""
+
+    def _item_manifest_video_path(self, global_idx):
+        global_idx = int(global_idx)
+        if hasattr(self, "manifest_video_paths") and 0 <= global_idx < len(self.manifest_video_paths):
+            return str(self.manifest_video_paths[global_idx])
+        return ""
+
+    def _item_decoded_video_path(self, global_idx):
+        global_idx = int(global_idx)
+        if hasattr(self, "decoded_paths") and 0 <= global_idx < len(self.decoded_paths):
+            return str(self.decoded_paths[global_idx])
+        return ""
+
+    def _item_video_chunks(self, global_idx):
+        if not hasattr(self, "video_chunks_per_item"):
+            return np.nan
+        return int(self.video_chunks_per_item[int(global_idx)].item())
+
+    def _item_text_chunks(self, global_idx):
+        if not hasattr(self, "text_chunks_per_item"):
+            return np.nan
+        return int(self.text_chunks_per_item[int(global_idx)].item())
+
+    def _case_common_fields(self, adapter_name, indices, local_query_idx, global_query_idx):
+        return {
+            "adapter": adapter_name,
+            "eval_scope": self.eval_scope,
+            "gallery_size": len(indices),
+            "query_local_idx": int(local_query_idx),
+            "query_global_idx": int(global_query_idx),
+            "feature_backend": "clip_frame" if self.args.feature_backend == "clip" else self.args.feature_backend,
+            "video_pooling": self.args.video_pooling,
+            "text_pooling": getattr(self.args, "text_pooling", "truncate"),
+            "text_preprocess": getattr(self.args, "text_preprocess", "none"),
+            "num_frames": self.args.num_frames,
+            "frame_sampling": getattr(self.args, "frame_sampling", "uniform"),
+            "video_chunk_stride": getattr(self.args, "video_chunk_stride", None),
+            "match_pooling": getattr(self.args, "match_pooling", "logmeanexp"),
+            "match_temperature": getattr(self.args, "match_temperature", np.nan),
+        }
+
+    def dump_retrieval_cases(self, indices, use_raw=False, topk=5, adapter_name=None):
+        if len(indices) < 1:
+            return None, None
+        adapter_name = adapter_name or ("raw" if use_raw or self.adapter == "raw" else self.adapter)
+        topk = min(max(1, int(topk)), len(indices))
+        index_list = [int(value) for value in indices.detach().cpu().tolist()]
+        logits, best_video_chunks, best_text_chunks, best_chunk_scores = self._retrieval_logits_and_chunk_details(
+            indices,
+            use_raw=use_raw,
+        )
+
+        v2t_rows = []
+        t2v_rows = []
+        for local_i, global_i in enumerate(index_list):
+            v2t_scores = logits[local_i]
+            positive_score = v2t_scores[local_i]
+            top_scores, top_positions = torch.topk(v2t_scores, k=topk)
+            rank = int((v2t_scores > positive_score).sum().item() + 1)
+            row = self._case_common_fields(adapter_name, index_list, local_i, global_i)
+            row.update({
+                "direction": "video_to_text",
+                "query_video_path": self._item_decoded_video_path(global_i),
+                "query_manifest_video_path": self._item_manifest_video_path(global_i),
+                "query_video_chunks": self._item_video_chunks(global_i),
+                "correct_global_idx": global_i,
+                "correct_text": self._item_text(global_i),
+                "correct_text_chunks": self._item_text_chunks(global_i),
+                "correct_rank": rank,
+                "correct_score": float(positive_score.item()),
+                "correct_best_video_chunk": int(best_video_chunks[local_i, local_i].item()),
+                "correct_best_text_chunk": int(best_text_chunks[local_i, local_i].item()),
+                "correct_best_chunk_cosine": float(best_chunk_scores[local_i, local_i].item()),
+                "top_global_indices": json.dumps([index_list[int(pos)] for pos in top_positions.tolist()]),
+                "top_scores": json.dumps([float(score) for score in top_scores.tolist()]),
+            })
+            for rank_idx, (score, pos) in enumerate(zip(top_scores.tolist(), top_positions.tolist()), start=1):
+                candidate_global = index_list[int(pos)]
+                row[f"top{rank_idx}_global_idx"] = candidate_global
+                row[f"top{rank_idx}_score"] = float(score)
+                row[f"top{rank_idx}_is_correct"] = candidate_global == global_i
+                row[f"top{rank_idx}_text"] = self._item_text(candidate_global)
+                row[f"top{rank_idx}_text_chunks"] = self._item_text_chunks(candidate_global)
+                row[f"top{rank_idx}_best_video_chunk"] = int(best_video_chunks[local_i, int(pos)].item())
+                row[f"top{rank_idx}_best_text_chunk"] = int(best_text_chunks[local_i, int(pos)].item())
+                row[f"top{rank_idx}_best_chunk_cosine"] = float(best_chunk_scores[local_i, int(pos)].item())
+            v2t_rows.append(row)
+
+            t2v_scores = logits[:, local_i]
+            positive_score = t2v_scores[local_i]
+            top_scores, top_positions = torch.topk(t2v_scores, k=topk)
+            rank = int((t2v_scores > positive_score).sum().item() + 1)
+            row = self._case_common_fields(adapter_name, index_list, local_i, global_i)
+            row.update({
+                "direction": "text_to_video",
+                "query_text": self._item_text(global_i),
+                "query_text_chunks": self._item_text_chunks(global_i),
+                "correct_global_idx": global_i,
+                "correct_video_path": self._item_decoded_video_path(global_i),
+                "correct_manifest_video_path": self._item_manifest_video_path(global_i),
+                "correct_video_chunks": self._item_video_chunks(global_i),
+                "correct_rank": rank,
+                "correct_score": float(positive_score.item()),
+                "correct_best_video_chunk": int(best_video_chunks[local_i, local_i].item()),
+                "correct_best_text_chunk": int(best_text_chunks[local_i, local_i].item()),
+                "correct_best_chunk_cosine": float(best_chunk_scores[local_i, local_i].item()),
+                "top_global_indices": json.dumps([index_list[int(pos)] for pos in top_positions.tolist()]),
+                "top_scores": json.dumps([float(score) for score in top_scores.tolist()]),
+            })
+            for rank_idx, (score, pos) in enumerate(zip(top_scores.tolist(), top_positions.tolist()), start=1):
+                candidate_global = index_list[int(pos)]
+                row[f"top{rank_idx}_global_idx"] = candidate_global
+                row[f"top{rank_idx}_score"] = float(score)
+                row[f"top{rank_idx}_is_correct"] = candidate_global == global_i
+                row[f"top{rank_idx}_video_path"] = self._item_decoded_video_path(candidate_global)
+                row[f"top{rank_idx}_manifest_video_path"] = self._item_manifest_video_path(candidate_global)
+                row[f"top{rank_idx}_video_chunks"] = self._item_video_chunks(candidate_global)
+                row[f"top{rank_idx}_best_video_chunk"] = int(best_video_chunks[int(pos), local_i].item())
+                row[f"top{rank_idx}_best_text_chunk"] = int(best_text_chunks[int(pos), local_i].item())
+                row[f"top{rank_idx}_best_chunk_cosine"] = float(best_chunk_scores[int(pos), local_i].item())
+            t2v_rows.append(row)
+
+        prefix = f"{adapter_name}_{self.eval_scope}"
+        v2t_path = os.path.join(self.result_path, prefix + "_retrieval_cases_v2t.csv")
+        t2v_path = os.path.join(self.result_path, prefix + "_retrieval_cases_t2v.csv")
+        pd.DataFrame(v2t_rows).to_csv(v2t_path, index=False)
+        pd.DataFrame(t2v_rows).to_csv(t2v_path, index=False)
+        print("Saved retrieval case dumps to:", v2t_path, "and", t2v_path)
+        return v2t_path, t2v_path
 
     def retrieval_diagnostics(self, indices, use_raw=False):
         self.set_eval_mode()
@@ -741,6 +929,20 @@ class VideoTextTrainer(ContrastiveTrainerBase):
             )
         )
         print("Saved results to:", result_csv)
+        if getattr(self.args, "dump_retrieval_cases", False):
+            topk = getattr(self.args, "retrieval_cases_topk", 5)
+            self.dump_retrieval_cases(
+                eval_idx,
+                use_raw=(self.adapter == "raw"),
+                topk=topk,
+            )
+            if self.adapter == "quantum":
+                self.dump_retrieval_cases(
+                    eval_idx,
+                    use_raw=True,
+                    topk=topk,
+                    adapter_name="raw_baseline",
+                )
         if self.checkpoint_path is not None:
             print("Saved checkpoint to:", self.checkpoint_path)
         return summary_row

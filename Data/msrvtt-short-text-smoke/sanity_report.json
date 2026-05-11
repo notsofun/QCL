@@ -1,0 +1,22 @@
+{
+  "dataset": "VLM2Vec/MSR-VTT",
+  "config": "train_7k",
+  "split": "train",
+  "accepted": 0,
+  "rejected": 200,
+  "target_rows": 10,
+  "caption_unique_rate": 0.0,
+  "duplicate_reject_rate": 0.0,
+  "duration_seconds": {
+    "min": null,
+    "mean": null,
+    "max": null
+  },
+  "pass": false,
+  "thresholds": {
+    "min_caption_unique_rate": 0.85,
+    "max_near_duplicate_rate": 0.05,
+    "min_duration": 4.0,
+    "max_duration": 40.0
+  }
+}

@@ -182,6 +182,15 @@ def build_parser():
     parser.add_argument("--val_ratio", default=0.1, type=float)
     parser.add_argument("--test_ratio", default=0.2, type=float)
     parser.add_argument("--eval_on_all", default=False, type=str2bool, nargs="?", const=True)
+    parser.add_argument(
+        "--dump_retrieval_cases",
+        default=False,
+        type=str2bool,
+        nargs="?",
+        const=True,
+        help="dump per-query topK retrieval cases for video_text diagnostics",
+    )
+    parser.add_argument("--retrieval_cases_topk", default=5, type=int)
 
     parser.add_argument("--use_quantum", default=True, type=str2bool, nargs="?", const=True, help=argparse.SUPPRESS)
     parser.add_argument("--projection_tail", default=None, choices=["identity", "quantum"], help=argparse.SUPPRESS)

@@ -121,3 +121,7 @@ python model/qcl_train.py
   keywords={Portable document format},
   doi={10.1109/ICASSP49660.2025.10889504}}
 ```
+
+## Video-description dataset curation
+
+If video-text experiments plateau even after adapter/pooling changes, first rebuild the dataset and run duplicate/decode sanity checks. See `docs/video_description_dataset_plan.md` and `scripts/curate_hf_video_description_dataset.py` for a Hugging Face MSR-VTT based workflow that produces a short `video_path,text` manifest plus `sanity_report.json` before training.
