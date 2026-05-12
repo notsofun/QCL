@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and sanity-check a compact Hugging Face video-description dataset.
+"""Build and sanity-check a compact Hugging Face full-video/text dataset.
 
 The output manifest is compatible with model/video_text_trainer.py:
 
@@ -39,7 +39,6 @@ import numpy as np
 from datasets import load_dataset
 from huggingface_hub import hf_hub_download
 
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = BASE_DIR / "Data" / "hf-video-text-short"
 VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif"}
@@ -47,25 +46,84 @@ VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif"}
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Materialize a high-quality short video-description dataset from Hugging Face."
+        description="Materialize full video/text pairs from Hugging Face, keeping only short videos."
     )
-    parser.add_argument("--dataset", default="VLM2Vec/MSR-VTT", help="Hugging Face dataset repo id.")
-    parser.add_argument("--config", default="train_7k", help="Dataset config/subset; pass '' when unused.")
+    parser.add_argument(
+        "--dataset", default="VLM2Vec/MSR-VTT", help="Hugging Face dataset repo id."
+    )
+    parser.add_argument(
+        "--config",
+        default="train_7k",
+        help="Dataset config/subset; pass '' when unused.",
+    )
     parser.add_argument("--split", default="train", help="Dataset split.")
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Output dataset directory.")
-    parser.add_argument("--cache-dir", default=None, help="Optional Hugging Face cache directory.")
-    parser.add_argument("--target-rows", type=int, default=500, help="Number of accepted pairs to write.")
-    parser.add_argument("--scan-rows", type=int, default=5000, help="Rows to scan before giving up.")
-    parser.add_argument("--min-duration", type=float, default=4.0, help="Minimum decoded video duration in seconds.")
-    parser.add_argument("--max-duration", type=float, default=40.0, help="Maximum decoded video duration in seconds.")
-    parser.add_argument("--max-caption-words", type=int, default=8, help="Keep only the first N caption words.")
-    parser.add_argument("--min-caption-words", type=int, default=2, help="Drop captions shorter than this.")
-    parser.add_argument("--video-column", default=None, help="Override the video/path column.")
-    parser.add_argument("--text-column", default=None, help="Override the caption/text column.")
-    parser.add_argument("--url-column", default=None, help="Override URL column for YouTube/direct source datasets.")
-    parser.add_argument("--start-column", default=None, help="Override clip start-time column.")
-    parser.add_argument("--end-column", default=None, help="Override clip end-time column.")
-    parser.add_argument("--duration-column", default=None, help="Override duration column.")
+    parser.add_argument(
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Output dataset directory.",
+    )
+    parser.add_argument(
+        "--cache-dir", default=None, help="Optional Hugging Face cache directory."
+    )
+    parser.add_argument(
+        "--target-rows",
+        type=int,
+        default=500,
+        help="Number of accepted pairs to write.",
+    )
+    parser.add_argument(
+        "--scan-rows", type=int, default=5000, help="Rows to scan before giving up."
+    )
+    parser.add_argument(
+        "--min-duration",
+        type=float,
+        default=4.0,
+        help="Minimum decoded video duration in seconds.",
+    )
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        default=600.0,
+        help="Maximum decoded full-video duration in seconds (default: 10 minutes).",
+    )
+    parser.add_argument(
+        "--max-text-words",
+        type=int,
+        default=512,
+        help="Drop rows whose full text has more than this many words; set 0 to disable.",
+    )
+    parser.add_argument(
+        "--max-caption-words",
+        type=int,
+        default=None,
+        help="Deprecated alias for --max-text-words; rows are rejected, not truncated.",
+    )
+    parser.add_argument(
+        "--min-caption-words",
+        type=int,
+        default=2,
+        help="Drop full texts shorter than this.",
+    )
+    parser.add_argument(
+        "--video-column", default=None, help="Override the video/path column."
+    )
+    parser.add_argument(
+        "--text-column", default=None, help="Override the caption/text column."
+    )
+    parser.add_argument(
+        "--url-column",
+        default=None,
+        help="Override URL column for YouTube/direct source datasets.",
+    )
+    parser.add_argument(
+        "--start-column", default=None, help="Override clip start-time column."
+    )
+    parser.add_argument(
+        "--end-column", default=None, help="Override clip end-time column."
+    )
+    parser.add_argument(
+        "--duration-column", default=None, help="Override duration column."
+    )
     parser.add_argument(
         "--preset",
         choices=["generic", "finevideo"],
@@ -80,7 +138,7 @@ def parse_args():
     parser.add_argument(
         "--streaming-shuffle-buffer",
         type=int,
-        default=1000,
+        default=0,
         help="Shuffle buffer for streaming datasets; set 0 to keep repository order.",
     )
     parser.add_argument(
@@ -110,6 +168,8 @@ def parse_args():
         help="Print a scan progress line every N candidate rows; 1 logs every candidate.",
     )
     args, unknown = parser.parse_known_args()
+    if args.max_caption_words is not None:
+        args.max_text_words = args.max_caption_words
     if unknown:
         if any(token == "\\" for token in unknown):
             parser.error(
@@ -123,6 +183,23 @@ def parse_args():
 
 def log(message):
     print(message, flush=True)
+
+
+def short_value(value, max_chars=180):
+    text = str(value or "").replace("\n", " ").strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 3]}..."
+
+
+def format_bytes(size):
+    if size is None:
+        return "unknown size"
+    size = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
 
 
 def first_existing_column(columns, preferred):
@@ -142,30 +219,68 @@ def infer_columns(dataset, args):
     if args.preset == "finevideo" and not columns:
         columns = ["mp4", "json"]
     if args.preset == "finevideo":
-        video_column = args.video_column or first_existing_column(columns, ["mp4", "video"])
+        video_column = args.video_column or first_existing_column(
+            columns, ["mp4", "video"]
+        )
         text_column = args.text_column or first_existing_column(columns, ["json"])
     else:
         video_column = args.video_column or first_existing_column(
-            columns, ["video", "videos", "video_path", "video_name", "file_name", "path", "mp4"]
+            columns,
+            ["video", "videos", "video_path", "video_name", "file_name", "path", "mp4"],
         )
         text_column = args.text_column or first_existing_column(
-            columns, ["caption", "text", "description", "sentence", "summary", "Caption"]
+            columns,
+            ["caption", "text", "description", "sentence", "summary", "Caption"],
         )
-    url_column = args.url_column or first_existing_column(columns, ["url", "youtube_url", "video_url", "download_url"])
-    start_column = args.start_column or first_existing_column(columns, ["start", "start time", "start_time", "clip_start"])
-    end_column = args.end_column or first_existing_column(columns, ["end", "end time", "end_time", "clip_end"])
-    duration_column = args.duration_column or first_existing_column(columns, ["duration", "duration_seconds", "seconds"])
+    url_column = args.url_column or first_existing_column(
+        columns, ["url", "youtube_url", "video_url", "download_url"]
+    )
+    start_column = args.start_column or first_existing_column(
+        columns, ["start", "start time", "start_time", "clip_start"]
+    )
+    end_column = args.end_column or first_existing_column(
+        columns, ["end", "end time", "end_time", "clip_end"]
+    )
+    duration_column = args.duration_column or first_existing_column(
+        columns, ["duration", "duration_seconds", "video_duration", "length", "seconds"]
+    )
 
     if not text_column:
         raise ValueError(f"No caption/text column found. Columns: {columns}")
     if not video_column and not url_column:
         raise ValueError(f"No video/path/url column found. Columns: {columns}")
-    return video_column, text_column, url_column, start_column, end_column, duration_column
+    return (
+        video_column,
+        text_column,
+        url_column,
+        start_column,
+        end_column,
+        duration_column,
+    )
 
 
-def caption_candidates(value):
+def text_parts(value):
+    """Return all text parts for a row without truncating list-valued fields."""
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        preferred = [
+            value.get("text"),
+            value.get("caption"),
+            value.get("description"),
+            value.get("summary"),
+            value.get("title"),
+        ]
+        parts = []
+        for item in preferred:
+            parts.extend(text_parts(item))
+        return parts or [json.dumps(value, ensure_ascii=False)]
     if isinstance(value, (list, tuple)):
-        return [str(item) for item in value if str(item).strip()]
+        parts = []
+        for item in value:
+            parts.extend(text_parts(item))
+        return parts
+
     text = str(value or "").strip()
     if not text:
         return []
@@ -175,28 +290,26 @@ def caption_candidates(value):
         except (SyntaxError, ValueError):
             parsed = None
         if isinstance(parsed, (list, tuple)):
-            return [str(item) for item in parsed if str(item).strip()]
+            return text_parts(parsed)
     return [text]
 
 
-def normalize_caption(text, max_words):
+def normalize_text(text):
     text = str(text or "").replace("\n", " ").strip()
     text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"[^\w\s'-]", " ", text, flags=re.UNICODE)
-    text = re.sub(r"\s+", " ", text).strip().lower()
-    words = text.split()
-    return " ".join(words[:max_words])
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
-def clean_caption(value, min_words, max_words):
-    cleaned = [normalize_caption(candidate, max_words) for candidate in caption_candidates(value)]
-    cleaned = [caption for caption in cleaned if caption]
-    valid = [caption for caption in cleaned if len(caption.split()) >= min_words]
-    if valid:
-        return max(valid, key=lambda caption: len(caption.split()))
-    if cleaned:
-        return max(cleaned, key=lambda caption: len(caption.split()))
-    return ""
+def clean_text(value):
+    """Keep the complete row text, joining multi-caption rows into one text field."""
+    cleaned = [normalize_text(part) for part in text_parts(value)]
+    cleaned = [part for part in cleaned if part]
+    return " ".join(dict.fromkeys(cleaned))
+
+
+def text_word_count(text):
+    return len(re.findall(r"\b\w+\b", str(text or ""), flags=re.UNICODE))
 
 
 def parse_timestamp(value):
@@ -227,8 +340,14 @@ def parse_timestamp(value):
 
 def timestamp_range(value):
     if isinstance(value, dict):
-        start = parse_timestamp(value.get("start_timestamp") or value.get("start") or value.get("start_time"))
-        end = parse_timestamp(value.get("end_timestamp") or value.get("end") or value.get("end_time"))
+        start = parse_timestamp(
+            value.get("start_timestamp")
+            or value.get("start")
+            or value.get("start_time")
+        )
+        end = parse_timestamp(
+            value.get("end_timestamp") or value.get("end") or value.get("end_time")
+        )
         return start, end
     if not isinstance(value, (list, tuple)) or len(value) < 2:
         return None, None
@@ -237,12 +356,69 @@ def timestamp_range(value):
     return start, end
 
 
+def row_duration_hint(row, duration_column=None):
+    if duration_column and row.get(duration_column) not in (None, ""):
+        return parse_timestamp(row.get(duration_column))
+    return None
+
+
+def finevideo_duration_hint(metadata):
+    metadata = parse_metadata(metadata)
+    for key in ("duration_seconds", "duration", "video_duration", "length", "seconds"):
+        if metadata.get(key) not in (None, ""):
+            return parse_timestamp(metadata.get(key))
+    return None
+
+
+def duration_allowed(duration, args):
+    if duration is None:
+        return True
+    return args.min_duration <= float(duration) <= args.max_duration
+
+
 def finevideo_category_allowed(metadata, category_filter):
     if not category_filter:
         return True
-    allowed = {part.strip().lower() for part in category_filter.split(",") if part.strip()}
+    allowed = {
+        part.strip().lower() for part in category_filter.split(",") if part.strip()
+    }
     category = str(metadata.get("content_parent_category") or "").strip().lower()
     return category in allowed
+
+
+def parse_metadata(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            try:
+                parsed = ast.literal_eval(value)
+            except (SyntaxError, ValueError):
+                return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def finevideo_full_text(metadata):
+    metadata = parse_metadata(metadata)
+    content = metadata.get("content_metadata") if isinstance(metadata, dict) else {}
+    values = []
+    if metadata.get("text_to_speech"):
+        values.append(metadata.get("text_to_speech"))
+    timecoded_text = metadata.get("timecoded_text_to_speech") or []
+    if isinstance(timecoded_text, list):
+        values.extend(
+            segment.get("text")
+            for segment in timecoded_text
+            if isinstance(segment, dict) and segment.get("text")
+        )
+    for container in (metadata, content if isinstance(content, dict) else {}):
+        for key in ("title", "description", "summary", "text", "caption"):
+            if container.get(key):
+                values.append(container.get(key))
+    return clean_text(values)
 
 
 def finevideo_clip_candidates(metadata, args):
@@ -254,27 +430,29 @@ def finevideo_clip_candidates(metadata, args):
                 metadata = ast.literal_eval(metadata)
             except (SyntaxError, ValueError):
                 metadata = {}
-    if not isinstance(metadata, dict) or not finevideo_category_allowed(metadata, args.finevideo_category):
+    if not isinstance(metadata, dict) or not finevideo_category_allowed(
+        metadata, args.finevideo_category
+    ):
         return []
 
     content = metadata.get("content_metadata") or {}
     candidates = []
 
-    for suggestion_index, suggestion in enumerate(content.get("trimmingSuggestions") or []):
+    for suggestion_index, suggestion in enumerate(
+        content.get("trimmingSuggestions") or []
+    ):
         if not isinstance(suggestion, dict):
             continue
-        start, end = timestamp_range(suggestion.get("timestamps") or suggestion.get("timestamp"))
+        start, end = timestamp_range(
+            suggestion.get("timestamps") or suggestion.get("timestamp")
+        )
         if start is None or end is None or end <= start:
             continue
         duration = end - start
         if duration < args.min_duration or duration > args.max_duration:
             continue
-        caption = clean_caption(
-            suggestion.get("description") or suggestion.get("title"),
-            args.min_caption_words,
-            args.max_caption_words,
-        )
-        if len(caption.split()) < args.min_caption_words:
+        caption = clean_text(suggestion.get("description") or suggestion.get("title"))
+        if text_word_count(caption) < args.min_caption_words:
             continue
         candidates.append(
             {
@@ -296,18 +474,16 @@ def finevideo_clip_candidates(metadata, args):
         for activity_index, activity in enumerate(activities):
             if not isinstance(activity, dict):
                 continue
-            start, end = timestamp_range(activity.get("timestamps") or activity.get("timestamp"))
+            start, end = timestamp_range(
+                activity.get("timestamps") or activity.get("timestamp")
+            )
             if start is None or end is None or end <= start:
                 continue
             duration = end - start
             if duration < args.min_duration or duration > args.max_duration:
                 continue
-            caption = clean_caption(
-                activity.get("description") or activity.get("title"),
-                args.min_caption_words,
-                args.max_caption_words,
-            )
-            if len(caption.split()) < args.min_caption_words:
+            caption = clean_text(activity.get("description") or activity.get("title"))
+            if text_word_count(caption) < args.min_caption_words:
                 continue
             candidates.append(
                 {
@@ -340,7 +516,7 @@ def parse_hf_resolve_url(value):
     resolve_index = parts.index("resolve")
     repo_id = "/".join(parts[1:resolve_index])
     revision = parts[resolve_index + 1]
-    filename = "/".join(parts[resolve_index + 2:])
+    filename = "/".join(parts[resolve_index + 2 :])
     return repo_id, revision, filename
 
 
@@ -348,11 +524,29 @@ def download_direct_url(url, output_path, timeout):
     parsed_hf = parse_hf_resolve_url(url)
     if parsed_hf:
         repo_id, revision, filename = parsed_hf
-        downloaded = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset", revision=revision)
+        log(f"  download start: hf://datasets/{repo_id}/{filename}")
+        downloaded = hf_hub_download(
+            repo_id=repo_id, filename=filename, repo_type="dataset", revision=revision
+        )
         shutil.copy2(downloaded, output_path)
+        log(f"  download done: {format_bytes(output_path.stat().st_size)}")
         return "hf-resolve-url"
-    with urllib.request.urlopen(url, timeout=timeout) as response, Path(output_path).open("wb") as handle:
-        shutil.copyfileobj(response, handle)
+    log(f"  download start: {short_value(url)}")
+    bytes_written = 0
+    with urllib.request.urlopen(url, timeout=timeout) as response, Path(
+        output_path
+    ).open("wb") as handle:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            handle.write(chunk)
+            bytes_written += len(chunk)
+            if bytes_written // (25 * 1024 * 1024) != (
+                bytes_written - len(chunk)
+            ) // (25 * 1024 * 1024):
+                log(f"  download progress: {format_bytes(bytes_written)}")
+    log(f"  download done: {format_bytes(output_path.stat().st_size)}")
     return "url"
 
 
@@ -362,6 +556,7 @@ def materialize_hf_path(dataset_name, config, source_path, output_path, cache_di
     if config:
         candidates.extend([f"{config}/{source_path}", f"videos/{source_path}"])
     for candidate in dict.fromkeys(candidates):
+        log(f"  download start: hf://datasets/{dataset_name}/{candidate}")
         downloaded = hf_hub_download(
             repo_id=dataset_name,
             filename=candidate,
@@ -370,14 +565,18 @@ def materialize_hf_path(dataset_name, config, source_path, output_path, cache_di
         )
         if Path(downloaded).exists():
             shutil.copy2(downloaded, output_path)
+            log(f"  download done: {format_bytes(output_path.stat().st_size)}")
             return f"hf-file:{candidate}"
     raise FileNotFoundError(source_path)
 
 
-def run_youtube_download(url, output_path, start_time, end_time, timeout):
+def run_youtube_download(url, output_path, timeout):
     if shutil.which("yt-dlp") is None:
-        raise RuntimeError("yt-dlp is not installed; rerun without YouTube sources or install yt-dlp")
+        raise RuntimeError(
+            "yt-dlp is not installed; rerun without YouTube sources or install yt-dlp"
+        )
     with tempfile.TemporaryDirectory() as tmpdir:
+        log(f"  download start: yt-dlp {short_value(url)}")
         tmp_template = str(Path(tmpdir) / "clip.%(ext)s")
         command = [
             "yt-dlp",
@@ -396,8 +595,6 @@ def run_youtube_download(url, output_path, start_time, end_time, timeout):
             "-o",
             tmp_template,
         ]
-        if start_time is not None and end_time is not None:
-            command.extend(["--download-sections", f"*{float(start_time)}-{float(end_time)}"])
         command.append(url)
         try:
             subprocess.run(
@@ -412,12 +609,15 @@ def run_youtube_download(url, output_path, start_time, end_time, timeout):
             raise RuntimeError(f"yt-dlp timed out after {timeout}s") from exc
         except subprocess.CalledProcessError as exc:
             output = (exc.stdout or "").strip().splitlines()
-            detail = " | ".join(output[-3:]) if output else f"exit code {exc.returncode}"
+            detail = (
+                " | ".join(output[-3:]) if output else f"exit code {exc.returncode}"
+            )
             raise RuntimeError(f"yt-dlp failed: {detail}") from exc
         candidates = sorted(Path(tmpdir).glob("clip.*"))
         if not candidates:
             raise RuntimeError("yt-dlp produced no output file")
         shutil.copy2(candidates[0], output_path)
+    log(f"  download done: {format_bytes(output_path.stat().st_size)}")
     return "yt-dlp"
 
 
@@ -437,11 +637,19 @@ def row_source(row, video_column, url_column):
     return None, None
 
 
-def materialize_unclipped_row(row, args, output_path, video_column, url_column, start_column, end_column):
+def materialize_unclipped_row(
+    row, args, output_path, video_column, url_column, start_column, end_column
+):
     source_kind, source_value = row_source(row, video_column, url_column)
     if source_kind == "bytes":
-        payload = source_value.get("bytes") if isinstance(source_value, dict) else source_value
+        log("  materialize start: embedded video bytes")
+        payload = (
+            source_value.get("bytes")
+            if isinstance(source_value, dict)
+            else source_value
+        )
         output_path.write_bytes(payload)
+        log(f"  materialize done: {format_bytes(output_path.stat().st_size)}")
         return "embedded-bytes"
     if not source_value:
         raise RuntimeError("no source")
@@ -450,28 +658,34 @@ def materialize_unclipped_row(row, args, output_path, video_column, url_column, 
     if source.startswith(("http://", "https://")):
         if "youtube.com/" in source or "youtu.be/" in source:
             if not args.download_youtube:
-                raise RuntimeError("youtube source skipped because --download-youtube was not set")
-            start = row.get(start_column) if start_column else None
-            end = row.get(end_column) if end_column else None
-            return run_youtube_download(source, output_path, start, end, args.download_timeout)
+                raise RuntimeError(
+                    "youtube source skipped because --download-youtube was not set"
+                )
+            return run_youtube_download(source, output_path, args.download_timeout)
         return download_direct_url(source, output_path, args.download_timeout)
 
     local_path = Path(source)
     if local_path.exists():
+        log(f"  materialize start: local file {short_value(local_path)}")
         shutil.copy2(local_path, output_path)
+        log(f"  materialize done: {format_bytes(output_path.stat().st_size)}")
         return "local-path"
 
     try:
-        return materialize_hf_path(args.dataset, args.config or None, source, output_path, args.cache_dir)
+        return materialize_hf_path(
+            args.dataset, args.config or None, source, output_path, args.cache_dir
+        )
     except Exception:
         if url_column and row.get(url_column) and str(row[url_column]) != source:
             fallback_url = str(row[url_column])
             if "youtube.com/" in fallback_url or "youtu.be/" in fallback_url:
                 if not args.download_youtube:
-                    raise RuntimeError("youtube fallback skipped because --download-youtube was not set")
-                start = row.get(start_column) if start_column else None
-                end = row.get(end_column) if end_column else None
-                return run_youtube_download(fallback_url, output_path, start, end, args.download_timeout)
+                    raise RuntimeError(
+                        "youtube fallback skipped because --download-youtube was not set"
+                    )
+                return run_youtube_download(
+                    fallback_url, output_path, args.download_timeout
+                )
             return download_direct_url(fallback_url, output_path, args.download_timeout)
         raise
 
@@ -521,12 +735,26 @@ def clip_video_opencv(input_path, output_path, start_time, end_time):
         raise RuntimeError("OpenCV clip writer produced no frames")
 
 
-def materialize_row(row, args, output_path, video_column, url_column, start_column, end_column, clip_start=None, clip_end=None):
+def materialize_row(
+    row,
+    args,
+    output_path,
+    video_column,
+    url_column,
+    start_column,
+    end_column,
+    clip_start=None,
+    clip_end=None,
+):
     if clip_start is None or clip_end is None:
-        return materialize_unclipped_row(row, args, output_path, video_column, url_column, start_column, end_column)
+        return materialize_unclipped_row(
+            row, args, output_path, video_column, url_column, start_column, end_column
+        )
     with tempfile.TemporaryDirectory() as tmpdir:
         full_path = Path(tmpdir) / "source.mp4"
-        source = materialize_unclipped_row(row, args, full_path, video_column, url_column, start_column, end_column)
+        source = materialize_unclipped_row(
+            row, args, full_path, video_column, url_column, start_column, end_column
+        )
         clip_video_opencv(full_path, output_path, float(clip_start), float(clip_end))
     return f"{source}|opencv-clip:{float(clip_start):.3f}-{float(clip_end):.3f}"
 
@@ -544,7 +772,13 @@ def video_stats(path):
     capture.release()
     if frames <= 0 or duration <= 0:
         raise RuntimeError("empty or undecodable video")
-    return {"frames": frames, "fps": fps, "duration": duration, "width": width, "height": height}
+    return {
+        "frames": frames,
+        "fps": fps,
+        "duration": duration,
+        "width": width,
+        "height": height,
+    }
 
 
 def frame_average_hash(frame):
@@ -608,7 +842,9 @@ def main():
             log("FineVideo is large and gated; enabling Hugging Face streaming mode.")
             args.streaming = True
 
-    log(f"Loading dataset={args.dataset} config={args.config or '<none>'} split={args.split}")
+    log(
+        f"Loading dataset={args.dataset} config={args.config or '<none>'} split={args.split}"
+    )
     try:
         dataset = load_dataset(
             args.dataset,
@@ -625,8 +861,12 @@ def main():
             ) from exc
         raise
     if args.streaming and args.streaming_shuffle_buffer > 0:
-        dataset = dataset.shuffle(buffer_size=args.streaming_shuffle_buffer, seed=args.seed)
-    video_column, text_column, url_column, start_column, end_column, duration_column = infer_columns(dataset, args)
+        dataset = dataset.shuffle(
+            buffer_size=args.streaming_shuffle_buffer, seed=args.seed
+        )
+    video_column, text_column, url_column, start_column, end_column, duration_column = (
+        infer_columns(dataset, args)
+    )
     log(
         "Columns: "
         f"video={video_column} text={text_column} url={url_column} "
@@ -651,6 +891,11 @@ def main():
         f"Scanning up to {scan_limit} rows for {args.target_rows} accepted examples "
         f"(download timeout: {args.download_timeout}s/video)"
     )
+    if args.streaming:
+        log(
+            "Streaming mode is active; video files are only downloaded after a "
+            "`trying row=...` line appears."
+        )
 
     accepted = []
     rejected = []
@@ -663,23 +908,60 @@ def main():
             break
         if len(accepted) >= args.target_rows:
             break
-        if args.log_every > 0 and (scanned_count == 1 or scanned_count % args.log_every == 0):
-            log(f"scan {scanned_count:>5}/{scan_limit}: accepted={len(accepted)} rejected={len(rejected)}")
-        clip_info = None
+        if args.log_every > 0 and (
+            scanned_count == 1 or scanned_count % args.log_every == 0
+        ):
+            log(
+                f"scan {scanned_count:>5}/{scan_limit}: accepted={len(accepted)} rejected={len(rejected)}"
+            )
+        metadata = None
         if args.preset == "finevideo":
-            clip_info = choose_finevideo_clip(row, text_column, args, rng)
-            if not clip_info:
-                rejected.append({"row": int(row_index), "reason": "no-finevideo-short-clip", "detail": "no activity candidate matched filters"})
+            metadata = parse_metadata(row.get(text_column))
+        duration_hint = row_duration_hint(row, duration_column)
+        if duration_hint is None and args.preset == "finevideo":
+            duration_hint = finevideo_duration_hint(metadata)
+        if not duration_allowed(duration_hint, args):
+            rejected.append(
+                {
+                    "row": int(row_index),
+                    "reason": "duration-hint-out-of-range",
+                    "detail": f"{float(duration_hint):.2f}s",
+                }
+            )
+            continue
+
+        if args.preset == "finevideo":
+            if not finevideo_category_allowed(metadata, args.finevideo_category):
+                rejected.append(
+                    {
+                        "row": int(row_index),
+                        "reason": "finevideo-category-filter",
+                        "detail": str(metadata.get("content_parent_category")),
+                    }
+                )
                 continue
-            caption = clip_info["caption"]
+            caption = finevideo_full_text(metadata) or clean_text(row.get(text_column))
         else:
-            caption = clean_caption(row.get(text_column), args.min_caption_words, args.max_caption_words)
-        word_count = len(caption.split())
+            caption = clean_text(row.get(text_column))
+        word_count = text_word_count(caption)
         if word_count < args.min_caption_words:
-            rejected.append({"row": int(row_index), "reason": "caption-too-short", "detail": caption})
+            rejected.append(
+                {"row": int(row_index), "reason": "text-too-short", "detail": caption}
+            )
+            continue
+        if args.max_text_words > 0 and word_count > args.max_text_words:
+            rejected.append(
+                {
+                    "row": int(row_index),
+                    "reason": "text-too-long",
+                    "detail": f"{word_count} words",
+                }
+            )
             continue
         if caption_counts.get(caption, 0) > 0:
-            rejected.append({"row": int(row_index), "reason": "duplicate-caption", "detail": caption})
+            rejected.append(
+                {"row": int(row_index), "reason": "duplicate-text", "detail": caption}
+            )
             continue
 
         suffix = ".mp4"
@@ -691,12 +973,12 @@ def main():
         output_path = videos_dir / f"sample_{len(accepted):06d}{suffix}"
         log(
             f"trying row={int(row_index)} accepted={len(accepted)}/{args.target_rows} "
-            f"source={source_kind or 'none'} caption={caption!r}"
+            f"source={source_kind or 'none'} text_words={word_count} "
+            f"duration_hint={duration_hint if duration_hint is not None else 'unknown'} "
+            f"text={short_value(caption)!r}"
         )
 
         try:
-            clip_start = clip_info["clip_start"] if clip_info else None
-            clip_end = clip_info["clip_end"] if clip_info else None
             source = materialize_row(
                 row,
                 args,
@@ -705,22 +987,36 @@ def main():
                 url_column,
                 start_column,
                 end_column,
-                clip_start=clip_start,
-                clip_end=clip_end,
             )
             stats = video_stats(output_path)
-            duration_hint = float(row[duration_column]) if duration_column and row.get(duration_column) else stats["duration"]
-            if duration_hint < args.min_duration or duration_hint > args.max_duration:
-                raise RuntimeError(f"duration-out-of-range:{duration_hint:.2f}s")
+            checked_duration = stats["duration"]
+            log(
+                f"  sanity: duration={checked_duration:.2f}s "
+                f"frames={stats['frames']} size={stats['width']}x{stats['height']}"
+            )
+            if (
+                checked_duration < args.min_duration
+                or checked_duration > args.max_duration
+            ):
+                raise RuntimeError(f"duration-out-of-range:{checked_duration:.2f}s")
             digest = file_sha256(output_path)
             if digest in exact_hashes:
                 raise RuntimeError("exact-video-duplicate")
             fingerprint = video_fingerprint(output_path)
-            if any(hamming(fingerprint, prior) <= args.near_duplicate_hamming for prior in fingerprints):
+            if any(
+                hamming(fingerprint, prior) <= args.near_duplicate_hamming
+                for prior in fingerprints
+            ):
                 raise RuntimeError("near-video-duplicate")
         except Exception as exc:
             output_path.unlink(missing_ok=True)
-            rejected.append({"row": int(row_index), "reason": "materialize-or-sanity-failed", "detail": str(exc)[:300]})
+            rejected.append(
+                {
+                    "row": int(row_index),
+                    "reason": "materialize-or-sanity-failed",
+                    "detail": str(exc)[:300],
+                }
+            )
             log(f"  skip row={int(row_index)}: {str(exc)[:220]}")
             continue
 
@@ -741,25 +1037,25 @@ def main():
                 "sha256": digest,
             }
         )
-        if clip_info:
-            accepted[-1].update(
-                {
-                    "clip_start": clip_info["clip_start"],
-                    "clip_end": clip_info["clip_end"],
-                    "clip_kind": clip_info["clip_kind"],
-                    "category": clip_info.get("category"),
-                    "scene_index": clip_info.get("scene_index"),
-                    "activity_index": clip_info.get("activity_index"),
-                }
-            )
-        log(f"accepted {len(accepted):>5}/{args.target_rows}: row={row_index} {caption!r}")
+        log(
+            f"accepted {len(accepted):>5}/{args.target_rows}: row={row_index} "
+            f"duration={stats['duration']:.2f}s text={short_value(caption)!r}"
+        )
 
-    manifest_rows = [{"video_path": row["video_path"], "text": row["text"]} for row in accepted]
+    manifest_rows = [
+        {"video_path": row["video_path"], "text": row["text"]} for row in accepted
+    ]
     write_csv(output_dir / "manifest.csv", manifest_rows, ["video_path", "text"])
-    write_csv(output_dir / "manifest_with_sanity.csv", accepted, list(accepted[0].keys()) if accepted else ["video_path", "text"])
+    write_csv(
+        output_dir / "manifest_with_sanity.csv",
+        accepted,
+        list(accepted[0].keys()) if accepted else ["video_path", "text"],
+    )
     write_csv(output_dir / "rejected.csv", rejected, ["row", "reason", "detail"])
 
-    duplicate_rejects = sum("duplicate" in row["detail"] or "duplicate" in row["reason"] for row in rejected)
+    duplicate_rejects = sum(
+        "duplicate" in row["detail"] or "duplicate" in row["reason"] for row in rejected
+    )
     scanned = len(accepted) + len(rejected)
     caption_unique_rate = len(caption_counts) / max(len(accepted), 1)
     near_duplicate_rate = duplicate_rejects / max(scanned, 1)
@@ -788,12 +1084,17 @@ def main():
             "max_near_duplicate_rate": args.max_near_duplicate_rate,
             "min_duration": args.min_duration,
             "max_duration": args.max_duration,
+            "max_text_words": args.max_text_words,
         },
     }
-    (output_dir / "sanity_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    (output_dir / "sanity_report.json").write_text(
+        json.dumps(report, indent=2), encoding="utf-8"
+    )
     log(json.dumps(report, indent=2))
     if not report["pass"]:
-        raise SystemExit("Sanity check failed; inspect sanity_report.json and rejected.csv before training.")
+        raise SystemExit(
+            "Sanity check failed; inspect sanity_report.json and rejected.csv before training."
+        )
 
 
 if __name__ == "__main__":
