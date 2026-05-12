@@ -1,0 +1,23 @@
+{
+  "dataset": "HuggingFaceFV/finevideo",
+  "config": "",
+  "split": "train",
+  "accepted": 500,
+  "rejected": 1277,
+  "target_rows": 500,
+  "caption_unique_rate": 1.0,
+  "duplicate_reject_rate": 0.0006,
+  "duration_seconds": {
+    "min": 19.186,
+    "mean": 76.902,
+    "max": 594.167
+  },
+  "pass": true,
+  "thresholds": {
+    "min_caption_unique_rate": 0.85,
+    "max_near_duplicate_rate": 0.05,
+    "min_duration": 4.0,
+    "max_duration": 600.0,
+    "max_text_words": 512
+  }
+}
