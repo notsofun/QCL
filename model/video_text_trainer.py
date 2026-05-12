@@ -65,6 +65,40 @@ class PostEncoderQuantumAdapter(nn.Module):
         return raw_features + self.residual_scale * quantum_delta
 
 
+class PostEncoderClassicalBottleneckAdapter(nn.Module):
+    def __init__(
+        self,
+        input_dim=768,
+        output_dim=768,
+        bottleneck_dim=10,
+        residual_scale=0.1,
+    ):
+        super().__init__()
+        self.output_dim = output_dim
+        self.bottleneck = nn.Sequential(
+            nn.Linear(input_dim, bottleneck_dim),
+            nn.GELU(),
+            nn.Linear(bottleneck_dim, output_dim),
+        )
+        self.residual_scale = nn.Parameter(torch.tensor(float(residual_scale)))
+
+    def forward(self, features):
+        raw_features = align_last_feature_dim(features, self.output_dim)
+        if features.dim() == 3:
+            batch_size, num_chunks, input_dim = features.shape
+            flat_features = features.reshape(batch_size * num_chunks, input_dim)
+            bottleneck_delta = self.bottleneck(flat_features).reshape(
+                batch_size,
+                num_chunks,
+                self.output_dim,
+            )
+            active_mask = (features.norm(dim=-1, keepdim=True) > 1e-8).to(raw_features.dtype)
+            return (raw_features + self.residual_scale * bottleneck_delta) * active_mask
+
+        bottleneck_delta = self.bottleneck(features)
+        return raw_features + self.residual_scale * bottleneck_delta
+
+
 def split_indices(num_items, val_ratio, test_ratio, seed):
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randperm(num_items, generator=generator)
@@ -127,8 +161,8 @@ class VideoTextTrainer(ContrastiveTrainerBase):
         if not args.manifest:
             raise ValueError("--manifest is required when --task video_text")
         self.adapter = adapter or getattr(args, "adapter", "quantum")
-        if self.adapter not in {"raw", "quantum"}:
-            raise ValueError("video_text adapter must be raw or quantum")
+        if self.adapter not in {"raw", "quantum", "classical_bottleneck"}:
+            raise ValueError("video_text adapter must be raw, quantum, or classical_bottleneck")
         self.projection_tail = self.adapter
         self.history = []
         self.best_val_scores = None
@@ -319,6 +353,18 @@ class VideoTextTrainer(ContrastiveTrainerBase):
             self.models = [self.video_model]
             self.trainable_modules = [self.video_model]
             checkpoint_name = f"video_text_quantum_adapter_{self.args.video_pooling}"
+            self.checkpoint_path = os.path.join(self.model_path, checkpoint_name + ".pth")
+        elif self.adapter == "classical_bottleneck":
+            self.video_model = PostEncoderClassicalBottleneckAdapter(
+                input_dim=video_input_dim,
+                output_dim=self.text_dim,
+                bottleneck_dim=self.args.n_qubits,
+                residual_scale=getattr(self.args, "quantum_residual_scale", 0.1),
+            ).to(self.device)
+            self.video_model.apply(weights_init_normal)
+            self.models = [self.video_model]
+            self.trainable_modules = [self.video_model]
+            checkpoint_name = f"video_text_classical_bottleneck_adapter_{self.args.video_pooling}"
             self.checkpoint_path = os.path.join(self.model_path, checkpoint_name + ".pth")
         else:
             self.models = []
@@ -895,7 +941,7 @@ class VideoTextTrainer(ContrastiveTrainerBase):
         return row
 
     def after_training(self):
-        if self.adapter == "quantum":
+        if self.adapter in {"quantum", "classical_bottleneck"}:
             checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
             self.video_model.load_state_dict(checkpoint["model"])
             if "logit_scale" in checkpoint:

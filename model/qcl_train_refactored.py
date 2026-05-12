@@ -167,8 +167,12 @@ def build_parser():
     parser.add_argument(
         "--adapter",
         default="compare",
-        choices=["compare", "raw", "quantum"],
-        help="video_text adapter: raw evaluates frozen features, quantum trains a post-encoder quantum adapter, compare runs both",
+        choices=["compare", "raw", "quantum", "classical_bottleneck"],
+        help=(
+            "video_text adapter: raw evaluates frozen features, quantum trains "
+            "a post-encoder quantum adapter, classical_bottleneck trains a "
+            "linear bottleneck adapter, compare runs raw and quantum"
+        ),
     )
     parser.add_argument("--temperature", default=0.07, type=float)
     parser.add_argument("--quantum_residual_scale", default=0.1, type=float)
